@@ -1,0 +1,5 @@
+{
+  "operator": "本機使用者",
+  "port": 8765,
+  "data_dir": "data"
+}

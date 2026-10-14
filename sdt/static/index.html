@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>決議追蹤器</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div>
+    <h1>SCADA 決議—模型—圖紙追蹤器</h1>
+    <p class="sub">本機資料 · 操作者：<span id="operator">-</span> · 今天：<span id="today">-</span></p>
+  </div>
+  <div class="actions">
+    <button id="btn-new" class="primary">＋ 新增事項</button>
+    <button id="btn-agenda">議程草稿</button>
+    <a id="btn-export" class="btn" href="/api/export.csv">匯出 CSV</a>
+    <a class="btn" href="/api/history.csv">匯出變更紀錄</a>
+    <label class="btn">匯入 CSV<input id="file-import" type="file" accept=".csv,text/csv" hidden></label>
+    <button id="btn-backup">備份</button>
+    <button id="btn-sample-load">載入範例</button>
+    <button id="btn-sample-clear" class="danger">清除範例</button>
+  </div>
+</header>
+
+<div id="msg" class="msg" hidden></div>
+
+<nav class="tabs" id="tabs"></nav>
+
+<section class="filters">
+  <input id="f-q" type="search" placeholder="搜尋編號、標題、描述、來源、圖號、模型…">
+  <select id="f-issue_type"><option value="">全部類型</option></select>
+  <select id="f-status"><option value="">全部狀態</option></select>
+  <select id="f-priority"><option value="">全部優先級</option></select>
+  <select id="f-source_status"><option value="">全部來源狀態</option></select>
+  <input id="f-owner" type="text" placeholder="負責人">
+  <select id="f-sort">
+    <option value="due_date">依期限</option>
+    <option value="priority">依優先級</option>
+    <option value="updated_at">依更新時間</option>
+    <option value="issue_id">依編號</option>
+    <option value="status">依狀態</option>
+    <option value="owner">依負責人</option>
+  </select>
+  <select id="f-order"><option value="asc">升冪</option><option value="desc">降冪</option></select>
+</section>
+
+<main>
+  <table class="grid">
+    <thead><tr>
+      <th>編號</th><th>類型</th><th>標題</th><th>負責人</th><th>期限</th><th>優先</th>
+      <th>狀態</th><th>來源狀態</th><th>圖號／版次</th><th>模型／元素</th>
+    </tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p id="empty" class="empty" hidden>沒有符合條件的事項</p>
+</main>
+
+<dialog id="dlg-issue">
+  <form id="form-issue" method="dialog">
+    <h2 id="dlg-title">新增事項</h2>
+    <p class="hint">沒有來源檔名、頁碼／段落與原文摘錄時，系統不允許標為「已確認」，會自動改為「缺乏證據」。</p>
+    <div id="form-fields" class="form-grid"></div>
+    <div id="form-errors" class="msg error" hidden></div>
+    <div class="dlg-actions">
+      <button type="button" id="btn-cancel">取消</button>
+      <button type="submit" class="primary">儲存</button>
+    </div>
+    <section id="history-wrap" hidden>
+      <h3>變更紀錄</h3>
+      <table class="grid small"><thead><tr><th>時間</th><th>操作者</th><th>動作</th><th>欄位</th><th>修改前</th><th>修改後</th></tr></thead>
+      <tbody id="history-rows"></tbody></table>
+    </section>
+  </form>
+</dialog>
+
+<dialog id="dlg-agenda">
+  <h2>協調會議議程草稿</h2>
+  <p class="hint">只整理台帳現有資料，不新增事項、不推定決議。</p>
+  <textarea id="agenda-text" readonly></textarea>
+  <div class="dlg-actions">
+    <button id="btn-agenda-copy">複製</button>
+    <button id="btn-agenda-download">下載 .md</button>
+    <button id="btn-agenda-close" class="primary">關閉</button>
+  </div>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

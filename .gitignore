@@ -1,0 +1,8 @@
+# 真實資料與個人設定一律不進版控
+data/
+config.json
+*.db
+*.csv
+*.md.bak
+__pycache__/
+*.pyc
