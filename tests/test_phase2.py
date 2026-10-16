@@ -434,11 +434,16 @@ class TestVerifierTerminal(unittest.TestCase):
             self.assertIn("error=failed", unknown.stderr)
             self.assertNotIn(marker, unknown_out)
 
+        # 沒有 --dir 時，腳本會用 SDT_VERIFY_DIR（預設 C:\Users\user\sdt-verify）。
+        # 這裡指到保證不存在的隨機路徑，讓測試不依賴本機是否有真實預設目錄，
+        # 並確認錯誤訊息不會把這個路徑印出來。
+        env["SDT_VERIFY_DIR"] = os.path.join(
+            tempfile.gettempdir(), "sdt-verify-does-not-exist-" + os.urandom(8).hex())
         bare = _run_verify([], env)
         bare_out = bare.stdout + bare.stderr
         self.assertEqual(bare.returncode, 2)
         self.assertIn("error=missing_dir", bare.stderr)
-        self.assertNotIn("sdt-verify", bare_out)
+        self.assertNotIn("sdt-verify-does-not-exist", bare_out)
         self.assertNotIn("Users", bare_out)
 
 
