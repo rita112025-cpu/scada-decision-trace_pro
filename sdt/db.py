@@ -4,7 +4,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 
-ISSUE_TYPES = ("會議決議", "規範要求", "圖面問題", "模型問題", "待確認")
+ISSUE_TYPES = ("會議決議", "待辦", "規範要求", "圖面問題", "模型問題", "待確認")
 SOURCE_STATUSES = ("已確認", "有爭議", "缺乏證據", "無法驗證")
 PRIORITIES = ("高", "中", "低")
 STATUSES = ("待處理", "處理中", "等待他人回覆", "待驗收", "已驗收", "已關閉")
@@ -65,6 +65,103 @@ CREATE TABLE IF NOT EXISTS issue_history (
 CREATE INDEX IF NOT EXISTS idx_history_issue ON issue_history(issue_id);
 """
 
+# 既有 issues 表維持原欄位；下列欄位與資料表在 migrate() 補上，不刪除原資料。
+TRACE_COLUMNS = (
+    "project_id", "transcript_id", "segment_ref", "draft_id", "extraction_method", "source_quote",
+)
+
+EXTRA_SCHEMA = """
+CREATE TABLE IF NOT EXISTS projects (
+    project_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(name);
+
+CREATE TABLE IF NOT EXISTS transcripts (
+    transcript_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    format TEXT NOT NULL,
+    raw_text TEXT NOT NULL,
+    source_filename TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT '',
+    mode TEXT NOT NULL DEFAULT '',
+    duration_seconds TEXT NOT NULL DEFAULT '',
+    export_status TEXT NOT NULL DEFAULT '',
+    export_time TEXT NOT NULL DEFAULT '',
+    imported_at TEXT NOT NULL,
+    segment_count INTEGER NOT NULL,
+    timestamp_status TEXT NOT NULL,
+    timestamp_detail TEXT NOT NULL DEFAULT '',
+    UNIQUE(project_id, content_hash)
+);
+
+CREATE TABLE IF NOT EXISTS transcript_segments (
+    segment_id TEXT PRIMARY KEY,
+    transcript_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    source_segment_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    raw_text TEXT NOT NULL,
+    speaker TEXT NOT NULL DEFAULT '',
+    start_seconds TEXT NOT NULL DEFAULT '',
+    end_seconds TEXT NOT NULL DEFAULT '',
+    timestamp_label TEXT NOT NULL,
+    timestamp_source TEXT NOT NULL DEFAULT '',
+    line_start INTEGER,
+    line_end INTEGER,
+    edited INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS drafts (
+    draft_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    transcript_id TEXT NOT NULL,
+    segment_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    source_quote TEXT NOT NULL,
+    location_label TEXT NOT NULL,
+    timestamp_label TEXT NOT NULL,
+    extraction_method TEXT NOT NULL,
+    limitation TEXT NOT NULL,
+    owner TEXT NOT NULL DEFAULT '',
+    owner_origin TEXT NOT NULL DEFAULT '未指定',
+    due_date TEXT NOT NULL DEFAULT '',
+    due_origin TEXT NOT NULL DEFAULT '未指定',
+    review_status TEXT NOT NULL,
+    issue_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS document_links (
+    link_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    issue_id TEXT NOT NULL,
+    notebook TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    snippet TEXT NOT NULL DEFAULT '',
+    page TEXT NOT NULL DEFAULT '',
+    line_start TEXT NOT NULL DEFAULT '',
+    line_end TEXT NOT NULL DEFAULT '',
+    timestamp TEXT NOT NULL DEFAULT '',
+    endorsement TEXT NOT NULL DEFAULT '未主張支持',
+    created_at TEXT NOT NULL,
+    UNIQUE(issue_id, chunk_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_segments_transcript ON transcript_segments(transcript_id, seq);
+CREATE INDEX IF NOT EXISTS idx_drafts_project ON drafts(project_id, review_status);
+CREATE INDEX IF NOT EXISTS idx_links_issue ON document_links(issue_id);
+"""
+
 
 class ValidationError(Exception):
     def __init__(self, errors):
@@ -73,7 +170,31 @@ class ValidationError(Exception):
 
 
 class NotFound(Exception):
-    pass
+    def __init__(self, key="", message="找不到此事項"):
+        super().__init__(message)
+        self.key = key
+        self.message = message
+
+
+def _table_columns(conn, table):
+    return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def migrate(conn):
+    """補上專案 ID、逐字稿與文件關聯。只新增欄位與資料表，不刪除、不改寫既有事項內容。"""
+    conn.executescript(EXTRA_SCHEMA)
+    cols = _table_columns(conn, "issues")
+    for col in TRACE_COLUMNS:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE issues ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id)")
+    # 依既有「專案」文字歸入穩定 ID。名稱相同的列共用一個專案；空白名稱也保留為一筆。
+    names = [r["project"] for r in conn.execute("SELECT DISTINCT project FROM issues")]
+    for name in names:
+        pid = ensure_project(conn, name)
+        conn.execute(
+            "UPDATE issues SET project_id=? WHERE project=? AND (project_id IS NULL OR project_id='')",
+            (pid, name))
 
 
 def connect(path):
@@ -81,6 +202,8 @@ def connect(path):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    migrate(conn)
+    conn.commit()
     return conn
 
 
@@ -185,6 +308,83 @@ def _next_issue_id(conn):
     return f"SDT-{n:04d}"
 
 
+def next_public_id(conn, table, column, prefix):
+    """不可變編號。只掃描指定資料表的既有編號，不重用已發出的 ID。"""
+    best = 0
+    for row in conn.execute(f"SELECT {column} FROM {table}"):
+        val = row[0]
+        if isinstance(val, str) and val.startswith(prefix):
+            tail = val[len(prefix):]
+            if tail.isdigit():
+                best = max(best, int(tail))
+    return f"{prefix}{best + 1:04d}"
+
+
+def list_projects(conn):
+    return [dict(r) for r in conn.execute(
+        "SELECT project_id, name, created_at FROM projects ORDER BY project_id")]
+
+
+def get_project(conn, project_id):
+    row = conn.execute(
+        "SELECT project_id, name, created_at FROM projects WHERE project_id=?", (project_id,)).fetchone()
+    if row is None:
+        raise NotFound(project_id, "找不到此專案")
+    return dict(row)
+
+
+def create_project(conn, name, *, now=None):
+    name = _clean_text(name)
+    if len(name) > 200:
+        raise ValidationError(["專案名稱過長（上限 200 字）"])
+    if conn.execute("SELECT 1 FROM projects WHERE name=?", (name,)).fetchone():
+        label = name or "（未命名）"
+        raise ValidationError([f"專案名稱「{label}」已存在"])
+    pid = next_public_id(conn, "projects", "project_id", "PRJ-")
+    when = now or now_str()
+    conn.execute("INSERT INTO projects(project_id, name, created_at) VALUES (?,?,?)", (pid, name, when))
+    return get_project(conn, pid)
+
+
+def ensure_project(conn, name, *, now=None):
+    """沿用同名專案；沒有才建立。名稱是顯示用，project_id 建立後不變。"""
+    name = _clean_text(name)
+    row = conn.execute("SELECT project_id FROM projects WHERE name=?", (name,)).fetchone()
+    if row:
+        return row["project_id"]
+    return create_project(conn, name, now=now)["project_id"]
+
+
+def bind_project(conn, data, clean):
+    """事項歸屬專案。有 project_id 時以 ID 為準，並把名稱改成該專案的現名（不會因此重新命名）。"""
+    pid = _clean_text((data or {}).get("project_id"))
+    if pid:
+        proj = get_project(conn, pid)
+        clean["project"] = proj["name"]
+        return proj["project_id"]
+    return ensure_project(conn, clean.get("project", ""))
+
+
+def rename_project(conn, project_id, new_name, operator, *, now=None):
+    """只改名稱。既有事項的 project_id 不變，台帳上的專案文字同步為新名稱並留下變更紀錄。"""
+    proj = get_project(conn, project_id)
+    new_name = _clean_text(new_name)
+    if len(new_name) > 200:
+        raise ValidationError(["專案名稱過長（上限 200 字）"])
+    if new_name == proj["name"]:
+        return proj
+    other = conn.execute("SELECT project_id FROM projects WHERE name=?", (new_name,)).fetchone()
+    if other:
+        label = new_name or "（未命名）"
+        raise ValidationError([f"專案名稱「{label}」已存在"])
+    when = now or now_str()
+    conn.execute("UPDATE projects SET name=? WHERE project_id=?", (new_name, project_id))
+    ids = [r[0] for r in conn.execute("SELECT issue_id FROM issues WHERE project_id=?", (project_id,))]
+    for iid in ids:
+        update_issue(conn, iid, {"project": new_name}, operator, now=when, action="rename-project")
+    return get_project(conn, project_id)
+
+
 def _log(conn, issue_id, when, operator, action, field, old, new):
     conn.execute(
         "INSERT INTO issue_history(issue_id, changed_at, operator, action, field, old_value, new_value)"
@@ -194,29 +394,40 @@ def _log(conn, issue_id, when, operator, action, field, old, new):
 def create_issue(conn, data, operator, *, now=None, action="create", is_sample=False,
                  issue_id=None, created_at=None):
     clean, warnings = normalize(data)
+    pid = bind_project(conn, data, clean)
     when = now or now_str()
     issue_id = _clean_text(issue_id or data.get("issue_id")) or _next_issue_id(conn)
     if conn.execute("SELECT 1 FROM issues WHERE issue_id=?", (issue_id,)).fetchone():
         raise ValidationError([f"事項編號 {issue_id} 已存在"])
-    cols = ["issue_id", *EDITABLE_FIELDS, "created_at", "updated_at", "is_sample"]
-    vals = [issue_id, *(clean[k] for k in EDITABLE_FIELDS), created_at or when, when, int(is_sample)]
+    cols = ["issue_id", *EDITABLE_FIELDS, "project_id", "created_at", "updated_at", "is_sample"]
+    vals = [issue_id, *(clean[k] for k in EDITABLE_FIELDS), pid, created_at or when, when, int(is_sample)]
     conn.execute(f"INSERT INTO issues({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", vals)
     for k in EDITABLE_FIELDS:
         if clean[k]:
             _log(conn, issue_id, when, operator, action, k, "", clean[k])
+    if pid:
+        _log(conn, issue_id, when, operator, action, "project_id", "", pid)
     return get_issue(conn, issue_id), warnings
 
 
 def update_issue(conn, issue_id, changes, operator, *, now=None, action="update"):
-    """部分更新：只覆寫 changes 中出現的欄位，逐欄記錄修改前後值。"""
+    """部分更新：只覆寫 changes 中出現的欄位，逐欄記錄修改前後值。
+
+    project_id 不在可編輯欄位裡。若傳入 project_id，事項改掛到該專案，名稱跟著該專案的現名，
+    不會把這次儲存變成重新命名。
+    """
     current = get_issue(conn, issue_id)
     merged = {k: current[k] for k in EDITABLE_FIELDS}
     merged.update({k: v for k, v in changes.items() if k in EDITABLE_FIELDS})
     clean, warnings = normalize(merged)
+    pid = bind_project(conn, changes, clean)
     diff = [k for k in EDITABLE_FIELDS if clean[k] != current[k]]
-    if not diff:
-        return current, warnings, []
     when = now or now_str()
+    if pid != (current.get("project_id") or ""):
+        conn.execute("UPDATE issues SET project_id=? WHERE issue_id=?", (pid, issue_id))
+        _log(conn, issue_id, when, operator, action, "project_id", current.get("project_id") or "", pid)
+    if not diff:
+        return get_issue(conn, issue_id), warnings, []
     sets = ", ".join(f"{k}=?" for k in diff)
     conn.execute(f"UPDATE issues SET {sets}, updated_at=? WHERE issue_id=?",
                  [*(clean[k] for k in diff), when, issue_id])
@@ -261,7 +472,14 @@ def list_issues(conn, *, view="all", q="", filters=None, sort="due_date", order=
         raise ValidationError([f"未知視圖 {view}"])
     where, args = _view_clause(view, today)
     clauses, params = [where], list(args)
-    for key, value in (filters or {}).items():
+    filters = filters or {}
+    project_id = filters.get("project_id") or ""
+    if project_id:
+        clauses.append("project_id=?")
+        params.append(project_id)
+    for key, value in filters.items():
+        if key == "project_id":
+            continue
         if key in EDITABLE_FIELDS and value:
             clauses.append(f"{key}=?")
             params.append(value)
@@ -291,8 +509,9 @@ def list_issues(conn, *, view="all", q="", filters=None, sort="due_date", order=
     return result
 
 
-def view_counts(conn, today=None):
-    return {v: len(list_issues(conn, view=v, today=today)) for v in VIEWS}
+def view_counts(conn, today=None, project_id=""):
+    filters = {"project_id": project_id} if project_id else None
+    return {v: len(list_issues(conn, view=v, today=today, filters=filters)) for v in VIEWS}
 
 
 def clear_sample(conn, operator):
@@ -300,5 +519,8 @@ def clear_sample(conn, operator):
     when = now_str()
     for i in ids:
         _log(conn, i, when, operator, "clear-sample", "*", "範例資料", "")
+    if ids:
+        marks = ",".join("?" * len(ids))
+        conn.execute(f"DELETE FROM document_links WHERE issue_id IN ({marks})", ids)
     conn.execute("DELETE FROM issues WHERE is_sample=1")
     return len(ids)

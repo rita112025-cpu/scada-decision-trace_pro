@@ -5,7 +5,13 @@ from dataclasses import dataclass
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-DEFAULTS = {"operator": "本機使用者", "port": 8765, "data_dir": "data"}
+DEFAULTS = {
+    "operator": "本機使用者",
+    "port": 8765,
+    "data_dir": "data",
+    "local_notebook_url": "",
+    "local_notebook_db": "",
+}
 
 
 @dataclass
@@ -13,6 +19,8 @@ class Config:
     operator: str
     port: int
     data_dir: pathlib.Path
+    local_notebook_url: str = ""
+    local_notebook_db: str = ""
 
     @property
     def db_path(self):
@@ -32,5 +40,13 @@ def load(path=None):
     if not data_dir.is_absolute():
         data_dir = ROOT / data_dir
     data_dir.mkdir(parents=True, exist_ok=True)
+    notebook_db = str(values.get("local_notebook_db") or "").strip()
+    if notebook_db:
+        db_path = pathlib.Path(notebook_db)
+        if not db_path.is_absolute():
+            db_path = ROOT / db_path
+        notebook_db = str(db_path)
     return Config(operator=str(values["operator"]).strip() or DEFAULTS["operator"],
-                  port=int(values["port"]), data_dir=data_dir)
+                  port=int(values["port"]), data_dir=data_dir,
+                  local_notebook_url=str(values.get("local_notebook_url") or "").strip(),
+                  local_notebook_db=notebook_db)

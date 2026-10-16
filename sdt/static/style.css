@@ -55,4 +55,11 @@ dialog h2 { margin: 0; }
 .form-grid textarea { min-height: 64px; resize: vertical; }
 .dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 #agenda-text { width: 100%; min-height: 50vh; margin-top: 10px; font-family: Consolas, monospace; font-size: 13px; }
-#history-wrap { margin-top: 18px; }
+#history-wrap, #origin-wrap, #doc-wrap { margin-top: 18px; }
+dialog { overflow: auto; }
+.quote { white-space: pre-wrap; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; margin: 8px 0 0; }
+.stack { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.card { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--bg); }
+.card h3 { margin: 0 0 4px; font-size: 14px; }
+.scroll { max-height: 45vh; overflow: auto; }
+.card .row-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }

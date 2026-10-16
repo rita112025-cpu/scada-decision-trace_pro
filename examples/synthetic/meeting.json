@@ -1,0 +1,73 @@
+{
+  "model": "synthetic-rule-check",
+  "language": "zh-TW",
+  "source_filename": "synthetic-meeting.wav",
+  "mode": "local",
+  "text": "決議：示範用 RTU 盤預留一組通訊模組空間。請林示範於 2026-12-01 前補上端子對照。建議採用新命名，是否同意？尚未決定 UPS 備援時間。不採用舊版端子編號。這只是討論，盤面空間也許不夠。",
+  "raw_text": "決議：示範用 RTU 盤預留一組通訊模組空間。請林示範於 2026-12-01 前補上端子對照。建議採用新命名，是否同意？尚未決定 UPS 備援時間。不採用舊版端子編號。這只是討論，盤面空間也許不夠。",
+  "segments": [
+    {
+      "id": 1,
+      "start": 0.0,
+      "end": 12.5,
+      "speaker": "講者未識別",
+      "text": "決議：示範用 RTU 盤預留一組通訊模組空間。",
+      "raw_text": "決議：示範用 RTU 盤預留一組通訊模組空間。",
+      "edited": false,
+      "timestamp_source": "chunk_window"
+    },
+    {
+      "id": 2,
+      "start": 12.5,
+      "end": 28.0,
+      "speaker": "講者未識別",
+      "text": "請林示範於 2026-12-01 前補上端子對照。",
+      "raw_text": "請林示範於 2026-12-01 前補上端子對照。",
+      "edited": false,
+      "timestamp_source": "chunk_window"
+    },
+    {
+      "id": 3,
+      "start": 28.0,
+      "end": 40.0,
+      "speaker": "講者未識別",
+      "text": "建議採用新命名，是否同意？",
+      "raw_text": "建議採用新命名，是否同意？",
+      "edited": false,
+      "timestamp_source": "chunk_window"
+    },
+    {
+      "id": 4,
+      "start": 40.0,
+      "end": 55.0,
+      "speaker": "講者未識別",
+      "text": "尚未決定 UPS 備援時間。",
+      "raw_text": "尚未決定 UPS 備援時間。",
+      "edited": false,
+      "timestamp_source": "chunk_window"
+    },
+    {
+      "id": 5,
+      "start": 55.0,
+      "end": 70.0,
+      "speaker": "講者未識別",
+      "text": "不採用舊版端子編號。",
+      "raw_text": "不採用舊版端子編號。",
+      "edited": false,
+      "timestamp_source": "chunk_window"
+    },
+    {
+      "id": 6,
+      "start": 70.0,
+      "end": 90.0,
+      "speaker": "講者未識別",
+      "text": "這只是討論，盤面空間也許不夠。",
+      "raw_text": "這只是討論，盤面空間也許不夠。",
+      "edited": false,
+      "timestamp_source": "chunk_window"
+    }
+  ],
+  "duration_seconds": 90.0,
+  "status": "completed",
+  "export_time": "2026-10-16T00:00:00.000Z"
+}
