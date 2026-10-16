@@ -977,13 +977,15 @@ class TestSpokenRules(Base):
             "就你們先把圖改一版。",
             "你們這邊先出圖。",
             "你先跟廠商對一下連鎖。",
-            "你們先看看告警文字，這個虛構盤的通訊位置跟線槽都還要再對過一遍才能收。",
             "你們先寄給我們虛構的點表。",
             "你先寫上這次的虛構修改。",
+            "你先想一下告警文字。",
+            "你們這邊先規劃虛構備援。",
         ]
         also_v5 = [
             "那你們先幫我們確認端子。",
             "嗯，你們先就幫我們把這個點補上。",
+            "你們先看看告警文字，這個虛構盤的通訊位置跟線槽都還要再對過一遍才能收。",
         ]
         narrow = "你們先把連鎖條件列出來。"
         for text in missed_by_v4 + also_v5 + [narrow]:
@@ -1001,6 +1003,10 @@ class TestSpokenRules(Base):
 
         self.assertEqual([c["cue"] for c in one(narrow, "rule:v3")], ["你們先"])
         self.assertEqual([c["cue"] for c in one(narrow, "rule:v4")], ["你們先"])
+        planned = "你們先規劃虛構備援。"
+        self.assertEqual([c["cue"] for c in one(planned, "rule:v4")], ["你們先"])
+        self.assertEqual([c["cue"] for c in one(planned)], ["你們先"])
+        self.assertEqual(one("你先想一下告警文字。", "rule:v4"), [])
 
         negatives = [
             "你們先報個價就好。",
