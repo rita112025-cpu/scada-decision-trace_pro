@@ -268,12 +268,20 @@ def analyze_file(path):
         raise
     except Exception:
         raise VerifyProblem("failed")
+    segments = parsed.get("segments") or []
+    sentences = 0
+    for seg in segments:
+        sentences += len(transcripts._sentences(seg.get("text") or ""))
+    counts = parsed.get("time_counts") or {}
     return {
         "filename": path.name,
-        "time_counts": parsed.get("time_counts") or {},
+        "time_counts": counts,
         "timestamp_status": parsed.get("timestamp_status", ""),
         "candidates": candidate_rows(parsed, path.name),
         "lines": line_map(parsed),
+        "segments": len(segments),
+        "sentences": sentences,
+        "parse_warnings": counts.get("time_error", 0),
     }
 
 
@@ -303,6 +311,8 @@ def build_report(directory, analyses, gold, pending, false_hits, docx_present, s
         counts = item["time_counts"]
         lines.append(
             f"檔案 {item['filename']}：時間狀態 {item['timestamp_status']}；"
+            f"段落 {item.get('segments', 0)}、句子 {item.get('sentences', 0)}、"
+            f"時間警告 {item.get('parse_warnings', 0)}；"
             f"完整時間 {counts.get('complete', 0)}、只有開始時間 {counts.get('start_only', 0)}、"
             f"沒有時間 {counts.get('no_time', 0)}、時間錯誤 {counts.get('time_error', 0)}；"
             f"候選 {len(item['candidates'])} 筆。"
@@ -403,6 +413,9 @@ def verify(directory):
         "report_path": str(out),
         "text": report,
         "files": len(analyses),
+        "segments": sum(item.get("segments", 0) for item in analyses),
+        "sentences": sum(item.get("sentences", 0) for item in analyses),
+        "parse_warnings": sum(item.get("parse_warnings", 0) for item in analyses),
         "candidates": len(predicted),
         "decisions": decisions,
         "todos": todos,
@@ -419,6 +432,9 @@ def _counts(result):
     return "\n".join([
         "status=0",
         f"files={result['files']}",
+        f"segments={result['segments']}",
+        f"sentences={result['sentences']}",
+        f"parse_warnings={result['parse_warnings']}",
         f"candidates={result['candidates']}",
         f"decisions={result['decisions']}",
         f"todos={result['todos']}",

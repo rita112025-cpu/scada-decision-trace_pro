@@ -386,8 +386,14 @@ def _summarize_txt_times(segments):
 
 
 def parse_txt(text):
-    """逐行解析。空白行略過，不要求段與段之間空行。一行格式不符不會把其他行改成無時間。"""
-    lines = text.split("\n")
+    """逐行解析。空白行略過，不要求段與段之間空行。一行格式不符不會把其他行改成無時間。
+
+    開頭的中文標題列保留為沒有時間的段落，不會讓後面的時間列整份失效。
+    換行除了 LF、CRLF，也接受只含 CR，以及 Unicode 行分隔，避免整份被併成一段。
+    """
+    if text.startswith("\ufeff"):
+        text = text[1:]
+    lines = text.splitlines()
     segments = []
     for line_no, line in enumerate(lines, start=1):
         if not line.strip():

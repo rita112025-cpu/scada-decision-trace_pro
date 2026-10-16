@@ -385,6 +385,9 @@ class TestVerifierTerminal(unittest.TestCase):
             self.assertNotIn("verify-report", combined)
             self.assertIn("status=0", proc.stdout)
             self.assertIn("files=1", proc.stdout)
+            self.assertIn("segments=1", proc.stdout)
+            self.assertIn("sentences=1", proc.stdout)
+            self.assertIn("parse_warnings=0", proc.stdout)
             self.assertIn("scored=1", proc.stdout)
             self.assertIn("refused=0", proc.stdout)
             report = (folder / "reports" / "verify-report.txt").read_text(encoding="utf-8")
@@ -675,3 +678,179 @@ class TestReextract(Base):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+_DECISION = "決議：本次採用合成備援盤。"
+_TODO = "待辦：更新合成盤面配置。"
+_ASSIGNED = "請林示範於 2026-12-01 前補上端子對照。"
+_HISTORICAL = "然後就是核准過的版本。"
+_FILLER = "然後就是一般討論。"
+_TITLE = "虛構會議標題甲。"
+
+
+def _clock(total_seconds):
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.00"
+
+
+def _en_dash_line(index, body):
+    start = index * 3
+    return f"[{_clock(start)}\u2013{_clock(start + 2)}] {body}"
+
+
+def _header_range_lines():
+    """虛構檔：中文標題在前，接著大量半形方括號與 en dash 的時間列。"""
+    headers = [
+        _TITLE,
+        "合成專案紀錄是否僅供測試？",
+        "地點在虛構會議室。",
+        "日期是二零二六年十一月二日。",
+        "出席有林示範與陳假設。",
+        "以下為合成逐字稿。",
+        "沒有真實會議內容。",
+        "時間標記僅供解析測試。",
+    ]
+    special = {10: _DECISION, 100: _TODO, 500: _ASSIGNED, 2000: _HISTORICAL}
+    stamps = [_en_dash_line(i, special.get(i, _FILLER)) for i in range(2442)]
+    return headers + [""] + stamps
+
+
+class TestHeaderRangeParse(unittest.TestCase):
+    def test_crlf_header_and_en_dash_lines_parse_and_extract(self):
+        lines = _header_range_lines()
+        self.assertEqual(len(lines), 2451)
+        self.assertEqual(sum(1 for line in lines if line.startswith("[")), 2442)
+        raw = "\r\n".join(lines)
+        data = raw.encode("utf-8")
+        self.assertFalse(data.startswith(b"\xef\xbb\xbf"))
+        self.assertTrue(data.startswith(_TITLE.encode("utf-8")))
+        name = "fictional-header-range.txt"
+        parsed = transcripts.parse_upload(name, raw)
+        counts = parsed["time_counts"]
+        self.assertEqual(len(parsed["segments"]), 2450)
+        self.assertEqual(counts, {"complete": 2442, "start_only": 0, "no_time": 8, "time_error": 0})
+        self.assertEqual(parsed["segments"][0]["text"], _TITLE)
+        self.assertEqual(parsed["segments"][0]["time_kind"], "no_time")
+        first_stamp = next(seg for seg in parsed["segments"] if seg["time_kind"] == "complete")
+        self.assertIn("\u2013", first_stamp["raw_text"])
+        self.assertEqual(first_stamp["start_seconds"], "0.000")
+        self.assertEqual(first_stamp["end_seconds"], "2.000")
+        self.assertFalse(first_stamp["text"].startswith("["))
+        _, normalized = transcripts.content_hash(raw)
+        again = transcripts.parse_upload(name, normalized)
+        self.assertEqual(len(again["segments"]), 2450)
+        self.assertEqual(again["time_counts"], counts)
+        found = transcripts.extract_candidates(parsed["segments"])
+        quotes = [item["source_quote"] for item in found]
+        self.assertEqual(quotes, [_DECISION, _TODO, _ASSIGNED])
+        self.assertTrue(all(not quote.startswith("[") for quote in quotes))
+        self.assertNotIn(_HISTORICAL, quotes)
+        self.assertEqual([item["rule_id"] for item in found], ["D1", "T1", "T2"])
+        assigned = found[2]
+        self.assertEqual((assigned["owner"], assigned["due_date"]), ("林示範", "2026-12-01"))
+        by_line = {item["segment_key"]: item["source_quote"] for item in found}
+        self.assertEqual(by_line, {"20": _DECISION, "110": _TODO, "510": _ASSIGNED})
+
+        env = os.environ.copy()
+        env.pop("SDT_VERIFY_DIR", None)
+        env["PYTHONIOENCODING"] = "utf-8"
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            (folder / name).write_bytes(data)
+            proc = _run_verify(["--dir", str(folder)], env)
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, combined)
+            self.assertEqual(proc.stderr, "")
+            self.assertEqual(proc.stdout, "\n".join([
+                "status=0",
+                "files=1",
+                "segments=2450",
+                "sentences=2450",
+                "parse_warnings=0",
+                "candidates=3",
+                "decisions=1",
+                "todos=2",
+                "gold=0",
+                "pending=0",
+                "false_hits=0",
+                "scored=0",
+                "refused=0",
+                "",
+            ]))
+            for hidden in (_TITLE, _DECISION, _TODO, _ASSIGNED, _HISTORICAL, name, str(folder), "虛構"):
+                self.assertNotIn(hidden, combined)
+            report = (folder / "reports" / "verify-report.txt").read_text(encoding="utf-8")
+            self.assertIn(name, report)
+            self.assertIn(_DECISION, report)
+            self.assertIn("段落 2450", report)
+
+    def test_other_line_separators_and_one_bad_stamp_stay_per_line(self):
+        samples = {
+            "fictional-cr.txt": "虛構標題乙。\r[00:00:01.00\u201300:00:02.00] " + _DECISION + "\r",
+            "fictional-u2028.txt": (
+                "虛構標題丙？\u2028[00:00:01.14\u201300:00:03.78] " + _DECISION
+                + "\u2028[00:00:04.00\u201300:00:05.00] " + _FILLER
+            ),
+            "fictional-u2029.txt": "虛構標題丁。\u2029[00:00:01.5\u201300:00:02.5] " + _DECISION,
+            "fictional-nel.txt": "虛構標題戊。\x85[00:00:01.00\u201300:00:02.00] " + _TODO,
+            "fictional-bom.txt": "\ufeff虛構標題庚。\r\n[00:00:01.00\u201300:00:02.00] " + _DECISION + "\r\n",
+        }
+        expected = {
+            "fictional-cr.txt": (2, 1, _DECISION),
+            "fictional-u2028.txt": (3, 2, _DECISION),
+            "fictional-u2029.txt": (2, 1, _DECISION),
+            "fictional-nel.txt": (2, 1, _TODO),
+            "fictional-bom.txt": (2, 1, _DECISION),
+        }
+        env = os.environ.copy()
+        env.pop("SDT_VERIFY_DIR", None)
+        env["PYTHONIOENCODING"] = "utf-8"
+        for name, text in samples.items():
+            parsed = transcripts.parse_upload(name, text)
+            segments, complete, quote = expected[name]
+            self.assertEqual(len(parsed["segments"]), segments, name)
+            self.assertEqual(parsed["time_counts"]["complete"], complete, name)
+            self.assertEqual(parsed["time_counts"]["time_error"], 0, name)
+            self.assertNotIn("\ufeff", parsed["segments"][0]["text"])
+            found = transcripts.extract_candidates(parsed["segments"])
+            self.assertEqual([item["source_quote"] for item in found], [quote], name)
+            self.assertFalse(found[0]["source_quote"].startswith("["), name)
+            with tempfile.TemporaryDirectory() as tmp:
+                folder = pathlib.Path(tmp)
+                (folder / name).write_bytes(text.encode("utf-8"))
+                proc = _run_verify(["--dir", str(folder)], env)
+                combined = proc.stdout + proc.stderr
+                self.assertEqual(proc.returncode, 0, combined)
+                self.assertIn(f"segments={segments}", proc.stdout)
+                self.assertIn("candidates=1", proc.stdout)
+                self.assertIn("parse_warnings=0", proc.stdout)
+                self.assertNotIn(quote, combined)
+                self.assertNotIn(name, combined)
+                self.assertNotIn(str(folder), combined)
+
+        warning = "\r\n".join([
+            "虛構標題己。",
+            "[00:00:01.00\u201300:00:02.00] " + _DECISION,
+            "[00:41:70\u201300:42:10] 這一秒超出範圍。",
+            "[00:00:03.00\u201300:00:04.00] " + _TODO,
+        ])
+        parsed = transcripts.parse_upload("fictional-warning.txt", warning)
+        self.assertEqual(len(parsed["segments"]), 4)
+        self.assertEqual(parsed["time_counts"], {
+            "complete": 2, "start_only": 0, "no_time": 1, "time_error": 1,
+        })
+        self.assertEqual(parsed["segments"][2]["text"], "這一秒超出範圍。")
+        self.assertEqual(parsed["segments"][3]["time_kind"], "complete")
+        quotes = [item["source_quote"] for item in transcripts.extract_candidates(parsed["segments"])]
+        self.assertEqual(quotes, [_DECISION, _TODO])
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            (folder / "fictional-warning.txt").write_bytes(warning.encode("utf-8"))
+            proc = _run_verify(["--dir", str(folder)], env)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("segments=4", proc.stdout)
+            self.assertIn("parse_warnings=1", proc.stdout)
+            self.assertIn("candidates=2", proc.stdout)
+            self.assertNotIn("超出範圍", proc.stdout + proc.stderr)
+            self.assertNotIn("fictional-warning", proc.stdout + proc.stderr)

@@ -164,7 +164,7 @@ python -m src.ui
 | Transcript_translation JSON 匯出 | 欄位含 `model`、`language`、`source_filename`、`mode`（`cloud`／`local`）、`text`、`raw_text`、`segments`、`duration_seconds`、`status`（必須是 `completed`）、`export_time`。每個 segment 含 `id`、`start`、`end`、`speaker`、`text`、`raw_text`、`edited`、`timestamp_source` | 使用檔內的開始與結束秒數，標為「齊全」 |
 | 帶起訖時間的 TXT | 單行 `[HH:MM:SS.sss–HH:MM:SS.sss] 文字`。區間可用 `–`、`—` 或 `-`，兩側可有空白。秒可以是整數或 1～3 位小數，內部記到毫秒 | 有開始與結束才標完整時間。一行一個段落，不要求段間空白行 |
 | Transcript_translation TXT 匯出 | 單行 `[HH:MM:SS] 講者：文字` | 只保存開始時間，結束時間留空。不補造結束時間 |
-| 混合 TXT | 上面幾種和沒有時間的行可以在同一個檔案 | 每行分開判斷。某一行格式錯誤不會把其他行改成無時間 |
+| 混合 TXT | 上面幾種和沒有時間的行可以在同一個檔案。開頭的中文標題列也算沒有時間的段落 | 每行分開判斷。某一行格式錯誤不會把其他行改成無時間。換行接受 LF、CRLF、只有 CR，以及 Unicode 行分隔 |
 | 其他 UTF-8 TXT | 沒有時間標記的非空白行 | 以行號定位，時間標為「無時間資訊」 |
 
 預覽會分別列出：完整時間、只有開始時間、沒有時間、時間錯誤的段落數。分秒超界、負時間、小數超過三位、結束早於開始，會標在該行，不補造時間。抽取用的正文會拿掉行首時間標記；存檔的原始行不改。
@@ -259,7 +259,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\verify_local.ps1
 py -3 scripts\verify_local.py --dir C:\Users\user\sdt-verify
 ```
 
-終端只顯示狀態碼與彙總數字（檔案數、候選數、決議數、待辦數、標註數、待確認數、誤收數、是否完成評分、拒絕筆數）。完整報告、候選原文、人工備註、檔名與路徑只寫進該目錄的 `reports\verify-report.txt`，不會印到終端。錯誤同樣只給狀態碼與固定錯誤代碼。
+終端只顯示狀態碼與彙總數字（檔案數、段落數、句子數、時間警告數、候選數、決議數、待辦數、標註數、待確認數、誤收數、是否完成評分、拒絕筆數）。段落數若是 0，表示時間列沒有被拆開。完整報告、候選原文、人工備註、檔名與路徑只寫進該目錄的 `reports\verify-report.txt`，不會印到終端。錯誤同樣只給狀態碼與固定錯誤代碼。
 
 沒有標註檔時，報告只給候選數、時間分段數，以及你若已填寫的誤收與待確認；不計算 precision／recall，也不聲稱召回率。標註都能唯一定位、且預測與答案可以一對一配對時，才會分別列出決議與待辦的 precision、recall，並寫明分子、分母和樣本是哪些 TXT。配對鍵是種類、檔名、行號與句序。
 
