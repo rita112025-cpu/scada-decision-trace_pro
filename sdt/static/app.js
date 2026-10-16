@@ -131,17 +131,23 @@ function buildForm(issue) {
   for (const [key, label] of META.fields) {
     if (["issue_id", "created_at", "updated_at"].includes(key)) continue;
     if (key === "project") {
+      const locked = Boolean(issue && issue.project_locked);
       const lab = el("label", "專案（ID 不可變）");
       const sel = document.createElement("select");
       sel.name = "project_id";
-      fillProjectSelect(sel, { includeNew: true, selected: issue ? issue.project_id : "" });
+      fillProjectSelect(sel, { includeNew: !locked, selected: issue ? issue.project_id : "" });
       const nameInput = document.createElement("input");
       nameInput.name = "new_project_name";
       nameInput.placeholder = "新專案名稱";
-      nameInput.hidden = sel.value !== "__new__";
-      sel.addEventListener("change", () => { nameInput.hidden = sel.value !== "__new__"; });
+      nameInput.hidden = locked || sel.value !== "__new__";
+      sel.addEventListener("change", () => { nameInput.hidden = locked || sel.value !== "__new__"; });
       const hint = el("span", issue && issue.project_id ? `目前 ID：${issue.project_id}` : "選擇既有專案，或建立新的 ID");
       lab.append(sel, nameInput, hint);
+      if (locked) {
+        sel.disabled = true;
+        nameInput.disabled = true;
+        lab.append(el("span", "此事項已有逐字稿來源或文件關聯，不能直接改掛到別的專案，以免追溯資料對不上。請另建事項。", "lock-note"));
+      }
       wrap.append(lab);
       continue;
     }

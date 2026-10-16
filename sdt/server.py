@@ -151,7 +151,9 @@ def make_handler(app):
                     return self._json(200, {"items": db.get_history(conn, parts[1])})
             if route == ("GET", "issues") and len(parts) == 2:
                 with app.conn() as conn:
-                    return self._json(200, db.get_issue(conn, parts[1]))
+                    issue = db.get_issue(conn, parts[1])
+                    issue["project_locked"] = db.project_move_blocked(conn, issue)
+                    return self._json(200, issue)
             if route == ("POST", "issues") and len(parts) == 1:
                 data = self._json_body()
                 with app.lock, app.conn() as conn:
@@ -274,7 +276,9 @@ def make_handler(app):
             if route == ("POST", "issues") and len(parts) == 3 and parts[2] == "links":
                 data = self._json_body()
                 with app.lock, app.conn() as conn:
-                    result = notebook.create_link(conn, parts[1], data.get("hit") or data)
+                    result = notebook.create_link(
+                        conn, parts[1], data.get("hit") or data,
+                        notebook_db=app.cfg.local_notebook_db)
                 return self._json(201 if result["created"] else 200, result)
             if route == ("POST", "links") and len(parts) == 3 and parts[2] == "locate":
                 with app.conn() as conn:

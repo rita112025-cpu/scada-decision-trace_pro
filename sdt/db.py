@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS document_links (
     line_end TEXT NOT NULL DEFAULT '',
     timestamp TEXT NOT NULL DEFAULT '',
     endorsement TEXT NOT NULL DEFAULT '未主張支持',
+    file_hash TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     UNIQUE(issue_id, chunk_id)
 );
@@ -187,6 +188,9 @@ def migrate(conn):
     for col in TRACE_COLUMNS:
         if col not in cols:
             conn.execute(f"ALTER TABLE issues ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    link_cols = _table_columns(conn, "document_links")
+    if "file_hash" not in link_cols:
+        conn.execute("ALTER TABLE document_links ADD COLUMN file_hash TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id)")
     # 依既有「專案」文字歸入穩定 ID。名稱相同的列共用一個專案；空白名稱也保留為一筆。
     names = [r["project"] for r in conn.execute("SELECT DISTINCT project FROM issues")]
@@ -410,20 +414,49 @@ def create_issue(conn, data, operator, *, now=None, action="create", is_sample=F
     return get_issue(conn, issue_id), warnings
 
 
+PROJECT_MOVE_BLOCKED = (
+    "此事項已有逐字稿來源或文件關聯，不能直接改掛到別的專案，以免追溯資料對不上。請另建事項。"
+)
+
+
+def project_move_blocked(conn, issue):
+    """已有逐字稿來源或任一文件關聯時，不允許改掛專案。"""
+    if not (issue.get("project_id") or ""):
+        return False
+    if issue.get("transcript_id") or issue.get("segment_ref") or issue.get("draft_id"):
+        return True
+    return conn.execute(
+        "SELECT 1 FROM document_links WHERE issue_id=? LIMIT 1", (issue["issue_id"],)
+    ).fetchone() is not None
+
+
+def _intended_project_id(conn, changes, project_name):
+    """算出這次儲存會落到哪個專案，尚不建立新專案。未知的 project_id 會丟 NotFound。"""
+    requested = _clean_text((changes or {}).get("project_id"))
+    if requested:
+        return get_project(conn, requested)["project_id"]
+    row = conn.execute("SELECT project_id FROM projects WHERE name=?", (project_name,)).fetchone()
+    return row["project_id"] if row else ""
+
+
 def update_issue(conn, issue_id, changes, operator, *, now=None, action="update"):
     """部分更新：只覆寫 changes 中出現的欄位，逐欄記錄修改前後值。
 
     project_id 不在可編輯欄位裡。若傳入 project_id，事項改掛到該專案，名稱跟著該專案的現名，
-    不會把這次儲存變成重新命名。
+    不會把這次儲存變成重新命名。已有逐字稿來源或文件關聯時，拒絕改掛。
     """
     current = get_issue(conn, issue_id)
     merged = {k: current[k] for k in EDITABLE_FIELDS}
     merged.update({k: v for k, v in changes.items() if k in EDITABLE_FIELDS})
     clean, warnings = normalize(merged)
+    current_pid = current.get("project_id") or ""
+    intended = _intended_project_id(conn, changes, clean["project"])
+    if intended != current_pid and project_move_blocked(conn, current):
+        raise ValidationError([PROJECT_MOVE_BLOCKED])
     pid = bind_project(conn, changes, clean)
     diff = [k for k in EDITABLE_FIELDS if clean[k] != current[k]]
     when = now or now_str()
-    if pid != (current.get("project_id") or ""):
+    if pid != current_pid:
         conn.execute("UPDATE issues SET project_id=? WHERE issue_id=?", (pid, issue_id))
         _log(conn, issue_id, when, operator, action, "project_id", current.get("project_id") or "", pid)
     if not diff:

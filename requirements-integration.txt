@@ -1,0 +1,11 @@
+# 只給 tests/test_notebook_live.py。本台帳執行時仍只用 Python 標準函式庫。
+# 版本是審查環境已安裝、且 live 測試能跑過的組合（2026-10-16）。
+starlette==1.8.0
+uvicorn==0.54.0
+python-multipart==0.0.32
+pypdf==6.20.1
+anyio==4.15.1
+click==8.5.0
+h11==0.16.0
+idna==3.20
+typing-extensions==4.16.0

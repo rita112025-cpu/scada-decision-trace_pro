@@ -193,12 +193,52 @@ def list_links(conn, issue_id):
     return [_link_row(r) for r in rows]
 
 
-def create_link(conn, issue_id, hit, *, now=None):
-    """儲存使用者選取的搜尋結果。不複製整份文件，也不把關聯標成「文件支持此決議」。"""
+def _query_source(db_path, source_id, chunk_id):
+    """唯讀查出 local-notebook 實際的檔名、筆記本與 sources.file_hash。
+
+    找不到列時回傳 None。資料庫打不開或沒有這些欄位時丟 NotebookUnavailable。
+    編號不是整數時丟 ValueError。不採用呼叫端自填的雜湊。
+    """
+    path = pathlib.Path((db_path or "").strip())
+    if not path.is_file():
+        raise NotebookUnavailable("找不到 local-notebook 資料庫檔，無法核對來源指紋。")
+    uri = path.resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.DatabaseError:
+        raise NotebookUnavailable("無法讀取 local-notebook 資料庫，無法核對來源指紋。")
+    try:
+        try:
+            source_key = int(source_id)
+            chunk_key = int(chunk_id)
+        except (TypeError, ValueError):
+            raise ValueError("source_id 或 chunk_id 不是整數")
+        try:
+            row = conn.execute(
+                """SELECT c.id AS chunk_id, c.page, c.line_start, c.line_end, c.timestamp,
+                          s.id AS source_id, s.filename, s.original_path, s.file_hash, n.name AS notebook
+                   FROM chunks c
+                   JOIN sources s ON s.id = c.source_id
+                   JOIN notebooks n ON n.id = c.notebook_id
+                   WHERE c.id=? AND s.id=?""",
+                (chunk_key, source_key)).fetchone()
+        except sqlite3.DatabaseError:
+            raise NotebookUnavailable("local-notebook 資料庫沒有預期的來源欄位，無法核對來源指紋。")
+    finally:
+        conn.close()
+    return row
+
+
+def create_link(conn, issue_id, hit, *, notebook_db="", now=None):
+    """儲存使用者選取的搜尋結果。不複製整份文件，也不把關聯標成「文件支持此決議」。
+
+    若設定了 local_notebook_db，會讀取該庫實際的檔名、筆記本名稱與 sources.file_hash
+    並存下來。呼叫端自填的 file_hash、版本、章節或「支持」旗標都不採用。
+    """
     issue = db.get_issue(conn, issue_id)
     if not isinstance(hit, dict):
         raise db.ValidationError(["請選擇一筆搜尋結果"])
-    # 用戶端若夾帶版本、章節或「支持」旗標，一律不採用。
     filename = db._clean_text(hit.get("filename") or hit.get("source_file"))
     notebook = db._clean_text(hit.get("notebook"))
     source_id = db._clean_text(hit.get("source_id"))
@@ -215,6 +255,21 @@ def create_link(conn, issue_id, hit, *, now=None):
     line_start = "" if hit.get("line_start") in (None, "") else str(hit.get("line_start"))
     line_end = "" if hit.get("line_end") in (None, "") else str(hit.get("line_end"))
     timestamp = "" if not hit.get("timestamp") else str(hit.get("timestamp"))
+    file_hash = ""
+    if (notebook_db or "").strip():
+        try:
+            source = _query_source(notebook_db, source_id, chunk_id)
+        except ValueError:
+            raise db.ValidationError(["source_id 或 chunk_id 不是 local-notebook 的整數編號，未建立關聯。"])
+        except NotebookUnavailable as e:
+            raise db.ValidationError([str(e) + "未建立關聯。"])
+        if source is None:
+            raise db.ValidationError(["在 local-notebook 資料庫找不到這個 source_id 與 chunk_id，未建立關聯。"])
+        if (source["filename"] or "") != filename or (source["notebook"] or "") != notebook:
+            raise db.ValidationError(["搜尋結果的檔名或筆記本與 local-notebook 資料庫不符，未建立關聯。"])
+        file_hash = (source["file_hash"] or "").strip()
+        if not file_hash:
+            raise db.ValidationError(["local-notebook 這筆來源沒有 file_hash，無法保存可核對的內容指紋，未建立關聯。"])
     existing = conn.execute(
         "SELECT * FROM document_links WHERE issue_id=? AND chunk_id=?",
         (issue_id, chunk_id)).fetchone()
@@ -226,17 +281,21 @@ def create_link(conn, issue_id, hit, *, now=None):
     conn.execute(
         """INSERT INTO document_links(
             link_id, project_id, issue_id, notebook, source_id, chunk_id, filename, snippet,
-            page, line_start, line_end, timestamp, endorsement, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            page, line_start, line_end, timestamp, endorsement, file_hash, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (link_id, issue["project_id"], issue_id, notebook, source_id, chunk_id, filename, snippet,
-         page, line_start, line_end, timestamp, "未主張支持", when))
+         page, line_start, line_end, timestamp, "未主張支持", file_hash, when))
     return {"created": True, "link": _link_row(conn.execute(
         "SELECT * FROM document_links WHERE link_id=?", (link_id,)).fetchone()),
             "message": "已建立文件關聯。這只表示選取了文件出處，不代表文件支持此決議。"}
 
 
 def locate_link(db_path, link):
-    """檢查關聯是否還對得到 local-notebook 裡的段落與複製檔。"""
+    """檢查關聯是否還對得到當初保存的那一份來源。
+
+    除了 source_id、chunk_id，還核對檔名、筆記本名稱，以及建立時保存的 sources.file_hash。
+    身分不符時保留原關聯資料（含原檔名），標示無法驗證，不換成另一份文件。
+    """
     base = {
         "link_id": link["link_id"],
         "filename": link["filename"],
@@ -247,6 +306,7 @@ def locate_link(db_path, link):
         "line_start": link["line_start"],
         "line_end": link["line_end"],
         "timestamp": link["timestamp"],
+        "file_hash": link.get("file_hash") or "",
         "endorsement": "未主張支持",
         "supports_decision": False,
     }
@@ -256,55 +316,49 @@ def locate_link(db_path, link):
             "未設定 local_notebook_db。網頁搜尋沒有依段落編號取回檔案路徑的介面，"
             "所以無法從這裡開啟檔案；已保存的關聯仍然在。"
         ))
-    path = pathlib.Path(path_text)
-    if not path.is_file():
-        return dict(base, status="無法驗證", message="找不到 local-notebook 資料庫檔，已保存的關聯仍然在。")
-    uri = path.resolve().as_uri() + "?mode=ro"
     try:
-        conn = sqlite3.connect(uri, uri=True)
-        conn.row_factory = sqlite3.Row
-    except sqlite3.DatabaseError:
-        return dict(base, status="無法驗證", message="無法讀取 local-notebook 資料庫，已保存的關聯仍然在。")
-    try:
-        try:
-            source_id = int(link["source_id"])
-            chunk_id = int(link["chunk_id"])
-        except (TypeError, ValueError):
-            return dict(base, status="來源失效", message="關聯裡的來源編號無法對應到 local-notebook。")
-        row = conn.execute(
-            """SELECT c.id AS chunk_id, c.page, c.line_start, c.line_end, c.timestamp,
-                      s.id AS source_id, s.filename, s.original_path, s.file_hash, n.name AS notebook
-               FROM chunks c
-               JOIN sources s ON s.id = c.source_id
-               JOIN notebooks n ON n.id = c.notebook_id
-               WHERE c.id=? AND s.id=?""",
-            (chunk_id, source_id)).fetchone()
-    except sqlite3.DatabaseError:
-        return dict(base, status="無法驗證", message="local-notebook 資料庫沒有預期的段落資料表，已保存的關聯仍然在。")
-    finally:
-        conn.close()
+        row = _query_source(path_text, link["source_id"], link["chunk_id"])
+    except ValueError:
+        return dict(base, status="來源失效", message="關聯裡的來源編號無法對應到 local-notebook。")
+    except NotebookUnavailable as e:
+        return dict(base, status="無法驗證", message=str(e) + "已保存的關聯仍然在。")
     if row is None:
         return dict(base, status="來源失效", message="local-notebook 已找不到此段落或來源檔。關聯紀錄仍保留，但無法開啟。")
+    saved_name = link.get("filename") or ""
+    saved_book = link.get("notebook") or ""
+    saved_hash = (link.get("file_hash") or "").strip()
+    row_name = row["filename"] or ""
+    row_book = row["notebook"] or ""
+    row_hash = (row["file_hash"] or "").strip()
+    same_label = row_name == saved_name and row_book == saved_book
+    same_hash = bool(saved_hash) and row_hash == saved_hash
+    if not (same_label and same_hash):
+        if saved_hash or not same_label:
+            message = (
+                "相同的 source_id／chunk_id 對到的檔名、筆記本或內容雜湊，"
+                "與建立關聯時保存的來源指紋不符。已保留原來的檔名，不改掛成另一份文件。"
+            )
+        else:
+            message = (
+                "這筆關聯沒有內容雜湊，不能只靠編號判斷是同一份文件，因此標為無法驗證。原檔名仍保留。"
+            )
+        return dict(base, status="無法驗證", message=message)
     original = row["original_path"] or ""
-    exists = bool(original) and pathlib.Path(original).is_file()
     located = dict(base)
     located.update({
-        "filename": row["filename"] or link["filename"],
-        "notebook": row["notebook"] or link["notebook"],
         "page": "" if row["page"] is None else str(row["page"]),
         "line_start": "" if row["line_start"] is None else str(row["line_start"]),
         "line_end": "" if row["line_end"] is None else str(row["line_end"]),
         "timestamp": row["timestamp"] or "",
-        "file_hash": row["file_hash"] or "",
         "original_path": original,
     })
-    if not exists:
+    if not original or not pathlib.Path(original).is_file():
         located["status"] = "來源失效"
-        located["message"] = "資料庫仍有此段落，但複製檔已不在 sources.original_path 記錄的路徑。關聯紀錄仍保留。"
+        located["message"] = "來源指紋相符，但複製檔已不在 sources.original_path 記錄的路徑。關聯紀錄與原檔名仍保留。"
         return located
     located["status"] = "可定位"
     located["message"] = (
-        "可定位。路徑是 local-notebook 複製到 data/originals 的檔案，不是台帳裡的副本。"
-        "頁碼、行號、時間戳只顯示資料庫裡實際有的欄位。"
+        "可定位。已核對檔名、筆記本與內容雜湊，不是只靠編號。"
+        "路徑是 local-notebook 複製到 data/originals 的檔案，不是台帳裡的副本。"
     )
     return located

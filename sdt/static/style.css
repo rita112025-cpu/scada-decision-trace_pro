@@ -17,6 +17,7 @@ body { margin: 0; background: var(--bg); color: var(--text);
   padding: 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
 h1 { margin: 0; font-size: 20px; }
 .sub, .hint { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+.lock-note { display: block; margin-top: 4px; color: var(--danger); }
 .actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 button, .btn { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 6px;
   background: var(--panel); color: var(--text); cursor: pointer; text-decoration: none; }

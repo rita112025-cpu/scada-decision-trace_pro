@@ -53,6 +53,36 @@ class TestServer(unittest.TestCase):
         last = r["items"][-1]
         self.assertEqual((last["operator"], last["old_value"], last["new_value"]), ("測試員", "待處理", "處理中"))
 
+    def test_linked_issue_cannot_change_project(self):
+        _, origin = self.req("POST", "/api/projects", {"name": "合成專案甲"})
+        _, other = self.req("POST", "/api/projects", {"name": "合成專案乙"})
+        _, created = self.req("POST", "/api/issues", {
+            "title": "有文件關聯", "project_id": origin["project"]["project_id"],
+        })
+        issue_id = created["issue"]["issue_id"]
+        status, linked = self.req("POST", f"/api/issues/{issue_id}/links", {"hit": {
+            "notebook": "合成筆記", "source_id": "1", "chunk_id": "2",
+            "filename": "engineering-note.txt", "snippet": "通訊模組預留",
+        }})
+        self.assertEqual(status, 201)
+        status, issue = self.req("GET", f"/api/issues/{issue_id}")
+        self.assertTrue(issue["project_locked"])
+        status, denied = self.req("PUT", f"/api/issues/{issue_id}", {
+            "project_id": other["project"]["project_id"], "title": "有文件關聯",
+        })
+        self.assertEqual(status, 400)
+        self.assertTrue(any("不能直接改掛" in err for err in denied["errors"]))
+        status, links = self.req("GET", f"/api/issues/{issue_id}/links")
+        self.assertEqual(len(links["items"]), 1)
+        self.assertEqual(links["items"][0]["filename"], "engineering-note.txt")
+        status, issue = self.req("GET", f"/api/issues/{issue_id}")
+        self.assertEqual(issue["project_id"], origin["project"]["project_id"])
+        _, plain = self.req("POST", "/api/issues", {
+            "title": "沒有追溯", "project_id": origin["project"]["project_id"],
+        })
+        status, unlocked = self.req("GET", f"/api/issues/{plain['issue']['issue_id']}")
+        self.assertFalse(unlocked["project_locked"])
+
     def test_validation_error_is_400(self):
         s, r = self.req("POST", "/api/issues", {"title": ""})
         self.assertEqual(s, 400)

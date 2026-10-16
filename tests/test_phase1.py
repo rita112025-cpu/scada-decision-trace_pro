@@ -18,6 +18,44 @@ def b64(data):
     return base64.b64encode(data).decode("ascii")
 
 
+def _write_notebook_db(path, *, filename, file_hash, notebook, original_path, source_id=1, chunk_id=2):
+    """最小的 local-notebook 資料表，只含定位會讀的欄位。雜湊值由測試給定，不假裝是檔案內容算出來的。"""
+    conn = sqlite3.connect(path)
+    conn.executescript("""
+        CREATE TABLE notebooks (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE sources (
+            id INTEGER PRIMARY KEY,
+            notebook_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            original_path TEXT NOT NULL,
+            file_type TEXT NOT NULL,
+            file_hash TEXT NOT NULL
+        );
+        CREATE TABLE chunks (
+            id INTEGER PRIMARY KEY,
+            source_id INTEGER NOT NULL,
+            notebook_id INTEGER NOT NULL,
+            seq INTEGER NOT NULL,
+            page INTEGER,
+            line_start INTEGER,
+            line_end INTEGER,
+            timestamp TEXT,
+            text TEXT NOT NULL
+        );
+    """)
+    conn.execute("INSERT INTO notebooks(id, name) VALUES (1, ?)", (notebook,))
+    conn.execute(
+        """INSERT INTO sources(id, notebook_id, filename, original_path, file_type, file_hash)
+           VALUES (?,?,?,?,?,?)""",
+        (source_id, 1, filename, original_path, "txt", file_hash))
+    conn.execute(
+        """INSERT INTO chunks(id, source_id, notebook_id, seq, page, line_start, line_end, timestamp, text)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (chunk_id, source_id, 1, 1, None, 3, 3, None, "合成段落"))
+    conn.commit()
+    conn.close()
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -208,6 +246,134 @@ class TestDraftsAndLedger(Base):
             "notebook": "合成筆記", "source_id": "3", "chunk_id": "9", "filename": "engineering-note.txt",
         })
         self.assertFalse(again["created"])
+        self.assertEqual(len(notebook.list_links(self.conn, issue["issue_id"])), 1)
+
+    def test_negation_and_cancellation_do_not_become_drafts(self):
+        segments = []
+        for i, text in enumerate((
+            "本案未核准。",
+            "這不是決議。",
+            "目前沒有待辦。",
+            "待辦已取消。",
+            "決議：示範用通訊模組維持原方案。",
+            "待辦：請林示範於 2026-12-01 前補上端子對照。",
+        ), start=1):
+            segments.append({
+                "source_segment_id": str(i),
+                "text": text,
+                "location_label": f"段落 {i}",
+                "timestamp_label": "無時間資訊",
+            })
+        found = transcripts.extract_candidates(segments)
+        quotes = [item["source_quote"] for item in found]
+        for blocked in ("本案未核准。", "這不是決議。", "目前沒有待辦。", "待辦已取消。"):
+            self.assertNotIn(blocked, quotes)
+        self.assertEqual(
+            [(item["kind"], item["source_quote"]) for item in found],
+            [
+                ("決議", "決議：示範用通訊模組維持原方案。"),
+                ("待辦", "待辦：請林示範於 2026-12-01 前補上端子對照。"),
+            ],
+        )
+
+    def test_traced_issue_cannot_change_project_and_links_stay(self):
+        origin = self.project("合成專案甲")
+        other = self.project("合成專案乙")
+        imported = self.import_json(origin["project_id"])
+        draft = next(d for d in imported["drafts"] if d["kind"] == "決議")
+        issue = transcripts.confirm_draft(self.conn, draft["draft_id"], "測試員")["issue"]
+        notebook.create_link(self.conn, issue["issue_id"], {
+            "notebook": "合成筆記", "source_id": "3", "chunk_id": "9",
+            "filename": "engineering-note.txt", "snippet": "通訊模組預留",
+        })
+        self.assertTrue(db.project_move_blocked(self.conn, issue))
+        before_projects = db.list_projects(self.conn)
+        with self.assertRaises(db.ValidationError) as cm:
+            db.update_issue(self.conn, issue["issue_id"], {"project_id": other["project_id"]}, "測試員")
+        self.assertIn("不能直接改掛", cm.exception.errors[0])
+        with self.assertRaises(db.ValidationError):
+            db.update_issue(self.conn, issue["issue_id"], {"project": "合成專案丙"}, "測試員")
+        self.assertEqual(
+            [p["name"] for p in db.list_projects(self.conn)],
+            [p["name"] for p in before_projects],
+        )
+        stayed = db.get_issue(self.conn, issue["issue_id"])
+        self.assertEqual(stayed["project_id"], origin["project_id"])
+        self.assertEqual(stayed["project"], origin["name"])
+        links = notebook.list_links(self.conn, issue["issue_id"])
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]["filename"], "engineering-note.txt")
+        self.assertEqual(links[0]["project_id"], origin["project_id"])
+        renamed = db.rename_project(self.conn, origin["project_id"], "合成專案甲改名", "測試員")
+        stayed = db.get_issue(self.conn, issue["issue_id"])
+        self.assertEqual(stayed["project_id"], origin["project_id"])
+        self.assertEqual(stayed["project"], renamed["name"])
+        self.assertEqual(notebook.list_links(self.conn, issue["issue_id"])[0]["filename"], "engineering-note.txt")
+        editable, _, diff = db.update_issue(self.conn, issue["issue_id"], {"title": "只改標題"}, "測試員")
+        self.assertEqual(diff, ["title"])
+        self.assertEqual(editable["project_id"], origin["project_id"])
+
+        plain = db.create_issue(
+            self.conn, {"title": "沒有追溯", "project_id": origin["project_id"]}, "測試員")[0]
+        self.assertFalse(db.project_move_blocked(self.conn, plain))
+        moved, _, diff = db.update_issue(
+            self.conn, plain["issue_id"], {"project_id": other["project_id"]}, "測試員")
+        self.assertIn("project", diff)
+        self.assertEqual(moved["project_id"], other["project_id"])
+
+    def test_locate_rejects_other_database_and_keeps_filename(self):
+        proj = self.project()
+        issue = db.create_issue(self.conn, {"title": "要關聯的事項", "project_id": proj["project_id"]}, "測試員")[0]
+        original = self.dir / "copy.txt"
+        original.write_text("合成原文", encoding="utf-8")
+        decoy = self.dir / "decoy.txt"
+        decoy.write_text("另一份文件", encoding="utf-8")
+        good = self.dir / "good.db"
+        wrong = self.dir / "wrong.db"
+        same_name = self.dir / "same-name.db"
+        _write_notebook_db(
+            good, filename="engineering-note.txt", file_hash="a" * 64,
+            original_path=str(original), notebook="合成筆記",
+        )
+        _write_notebook_db(
+            wrong, filename="other-note.txt", file_hash="b" * 64,
+            original_path=str(decoy), notebook="另一本筆記",
+        )
+        _write_notebook_db(
+            same_name, filename="engineering-note.txt", file_hash="c" * 64,
+            original_path=str(decoy), notebook="合成筆記",
+        )
+        created = notebook.create_link(self.conn, issue["issue_id"], {
+            "notebook": "合成筆記", "source_id": "1", "chunk_id": "2",
+            "filename": "engineering-note.txt", "snippet": "通訊模組預留",
+            "file_hash": "client-supplied-fake", "line_start": 3, "line_end": 3,
+        }, notebook_db=str(good))
+        self.assertTrue(created["created"])
+        self.assertEqual(created["link"]["file_hash"], "a" * 64)
+        self.assertEqual(created["link"]["filename"], "engineering-note.txt")
+        link = created["link"]
+        matched = notebook.locate_link(str(good), link)
+        self.assertEqual(matched["status"], "可定位")
+        self.assertEqual(matched["filename"], "engineering-note.txt")
+        self.assertEqual(matched["original_path"], str(original))
+        mismatched = notebook.locate_link(str(wrong), link)
+        self.assertEqual(mismatched["status"], "無法驗證")
+        self.assertEqual(mismatched["filename"], "engineering-note.txt")
+        self.assertNotIn("original_path", mismatched)
+        self.assertNotIn("other-note.txt", mismatched["message"])
+        self.assertEqual(mismatched["notebook"], "合成筆記")
+        same_filename = notebook.locate_link(str(same_name), link)
+        self.assertEqual(same_filename["status"], "無法驗證")
+        self.assertEqual(same_filename["filename"], "engineering-note.txt")
+        self.assertNotIn("original_path", same_filename)
+        stored = notebook.list_links(self.conn, issue["issue_id"])[0]
+        self.assertEqual(stored["filename"], "engineering-note.txt")
+        self.assertEqual(stored["file_hash"], "a" * 64)
+        with self.assertRaises(db.ValidationError):
+            notebook.create_link(self.conn, issue["issue_id"], {
+                "notebook": "合成筆記", "source_id": "1", "chunk_id": "2",
+                "filename": "other-note.txt",
+            }, notebook_db=str(good))
         self.assertEqual(len(notebook.list_links(self.conn, issue["issue_id"])), 1)
 
     def test_search_outage_and_bad_import_keep_existing_rows(self):

@@ -1,13 +1,16 @@
 """對真正的 local-notebook 網頁搜尋做端到端測試。
 
-缺少 starlette／uvicorn／pypdf，或 SQLite 沒有 FTS5 trigram 時會 skip。
-這個檔案不把 mock 搜尋當成介接成功。
+路徑取自環境變數 SDT_NOTEBOOK_ROOT，未設定時為 /tmp/source-repos/local-notebook。
+缺少該目錄、starlette／uvicorn／pypdf，或 SQLite 沒有 FTS5 trigram 時：
+一般執行會 skip；SDT_INTEGRATION_STRICT=1 時改為失敗，不略過。
+套件版本見 requirements-integration.txt。這個檔案不把 mock 搜尋當成介接成功。
 """
 import base64
 import json
 import os
 import pathlib
 import socket
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -17,20 +20,31 @@ import urllib.parse
 import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-NOTEBOOK_ROOT = pathlib.Path("/tmp/source-repos/local-notebook")
+NOTEBOOK_ROOT = pathlib.Path(os.environ.get("SDT_NOTEBOOK_ROOT", "/tmp/source-repos/local-notebook"))
 EXAMPLE = ROOT / "examples" / "synthetic" / "engineering-note.txt"
 TRANSCRIPT = ROOT / "examples" / "synthetic" / "meeting.json"
 
 
+def _strict():
+    return os.environ.get("SDT_INTEGRATION_STRICT", "").strip() == "1"
+
+
 def _deps_ready():
     if not NOTEBOOK_ROOT.is_dir():
-        return "找不到唯讀 clone 的 local-notebook"
+        return f"找不到 local-notebook（SDT_NOTEBOOK_ROOT={NOTEBOOK_ROOT}）"
     try:
         import pypdf  # noqa: F401
         import starlette  # noqa: F401
         import uvicorn  # noqa: F401
     except ImportError as e:
-        return f"缺少套件：{e.name}"
+        return f"缺少套件：{e.name}（見 requirements-integration.txt）"
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE VIRTUAL TABLE t USING fts5(text, tokenize='trigram')")
+    except sqlite3.DatabaseError as e:
+        return f"SQLite 沒有 FTS5 trigram：{e}"
+    finally:
+        conn.close()
     return ""
 
 
@@ -38,6 +52,8 @@ class TestLiveNotebook(unittest.TestCase):
     def setUp(self):
         reason = _deps_ready()
         if reason:
+            if _strict():
+                self.fail("整合驗收模式缺少必要環境，不得略過：" + reason)
             self.skipTest(reason)
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = pathlib.Path(self.tmp.name)
