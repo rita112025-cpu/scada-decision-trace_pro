@@ -11,6 +11,7 @@ from . import agenda, backup, csvio, db, notebook, sample, transcripts
 
 STATIC_DIR = pathlib.Path(__file__).resolve().parent / "static"
 CLEAR_SAMPLE_PHRASE = "清除範例資料"
+CLEAR_ALL_PHRASE = "清空"
 
 
 class App:
@@ -99,6 +100,8 @@ def make_handler(app):
                 return self._api(method, parts[1:], query)
             except db.ValidationError as e:
                 self._json(400, {"errors": e.errors})
+            except transcripts.NeedsChoice as e:
+                self._json(409, dict(e.plan, errors=[e.plan["message"]], deleted=False))
             except notebook.NotebookUnavailable as e:
                 self._json(503, {"errors": e.errors})
             except ValueError as e:  # 備份／還原的已知錯誤，訊息不含路徑
@@ -129,6 +132,7 @@ def make_handler(app):
                     "priorities": db.PRIORITIES, "statuses": db.STATUSES,
                     "acceptance_results": db.ACCEPTANCE_RESULTS, "views": db.VIEWS,
                     "clear_sample_phrase": CLEAR_SAMPLE_PHRASE,
+                    "clear_all_phrase": CLEAR_ALL_PHRASE,
                     "extraction_method": transcripts.EXTRACTION_METHOD,
                     "extraction_limitation": transcripts.LIMITATION,
                     "draft_statuses": ["草稿", "已確認", "已捨棄"],
@@ -159,6 +163,13 @@ def make_handler(app):
                 with app.lock, app.conn() as conn:
                     issue, warnings = db.create_issue(conn, data, app.cfg.operator)
                 return self._json(201, {"issue": issue, "warnings": warnings})
+            if route == ("POST", "issues") and len(parts) == 3 and parts[2] == "delete":
+                data = self._json_body()
+                if data.get("confirm") is not True:
+                    raise db.ValidationError(["請確認後再刪除事項。這不會刪磁碟上的檔案。"])
+                with app.lock, app.conn() as conn:
+                    result = db.delete_issue(conn, parts[1], app.cfg.operator)
+                return self._json(200, result)
             if route == ("PUT", "issues") and len(parts) == 2:
                 data = self._json_body()
                 with app.lock, app.conn() as conn:
@@ -193,6 +204,18 @@ def make_handler(app):
                 with app.lock, app.conn() as conn:
                     n = sample.load_sample(conn, app.cfg.operator, today)
                 return self._json(200, {"loaded": n})
+            if route == ("POST", "data") and parts[1:] == ["clear"]:
+                if self._json_body().get("confirm") != CLEAR_ALL_PHRASE:
+                    raise db.ValidationError([
+                        f"請輸入「{CLEAR_ALL_PHRASE}」確認。這會刪除台帳、逐字稿與草稿，不會刪磁碟上的原始 TXT。"])
+                with app.lock:
+                    pre = backup.backup(app.cfg.db_path, app.cfg.backup_dir, label="pre-clear-all")
+                    with app.conn() as conn:
+                        counts = db.wipe_all(conn)
+                return self._json(200, {
+                    "cleared": True, "backup": pre.name, "counts": counts,
+                    "message": "已先備份，再清空台帳、逐字稿與草稿。沒有刪磁碟上的原始 TXT，也沒有刪既有備份檔。",
+                })
             if route == ("POST", "sample") and parts[1:] == ["clear"]:
                 if self._json_body().get("confirm") != CLEAR_SAMPLE_PHRASE:
                     raise db.ValidationError([f"請輸入「{CLEAR_SAMPLE_PHRASE}」確認"])
@@ -229,6 +252,17 @@ def make_handler(app):
                         conn, project_id=data.get("project_id", ""), filename=data.get("filename", ""),
                         content_base64=data.get("content_base64", ""), operator=app.cfg.operator)
                 return self._json(200, result)
+            if route == ("POST", "transcripts") and len(parts) == 3 and parts[2] == "delete":
+                data = self._json_body()
+                with app.lock, app.conn() as conn:
+                    if data.get("preview") is True or data.get("confirm") is not True:
+                        plan = transcripts.delete_transcript_preview(conn, parts[1])
+                        if data.get("confirm") is not True and data.get("preview") is not True:
+                            plan = dict(plan, message="請確認後再刪除逐字稿。" + plan["message"])
+                    else:
+                        plan = transcripts.delete_transcript(
+                            conn, parts[1], app.cfg.operator, ledger=str(data.get("ledger") or ""))
+                return self._json(200, plan)
             if route == ("POST", "transcripts") and parts[1:2] != ["preview"] and parts[2:] == ["reparse", "preview"]:
                 with app.conn() as conn:
                     return self._json(200, transcripts.reparse_preview(conn, parts[1]))
@@ -276,6 +310,13 @@ def make_handler(app):
             if route == ("POST", "drafts") and len(parts) == 3 and parts[2] == "confirm":
                 with app.lock, app.conn() as conn:
                     return self._json(200, transcripts.confirm_draft(conn, parts[1], app.cfg.operator))
+            if route == ("POST", "drafts") and len(parts) == 3 and parts[2] == "delete":
+                data = self._json_body()
+                if data.get("confirm") is not True:
+                    raise db.ValidationError(["請確認後再刪除草稿。刪除不會留下捨棄紀錄，也不會刪台帳。"])
+                with app.lock, app.conn() as conn:
+                    result = transcripts.delete_draft(conn, parts[1])
+                return self._json(200, result)
             if route == ("POST", "drafts") and len(parts) == 3 and parts[2] == "discard":
                 with app.lock, app.conn() as conn:
                     return self._json(200, transcripts.discard_draft(conn, parts[1]))

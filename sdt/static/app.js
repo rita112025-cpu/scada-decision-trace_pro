@@ -7,6 +7,7 @@ const TEXTAREAS = new Set(["description", "source_excerpt", "acceptance_criteria
 const ACTION_LABELS = {
   create: "新增", update: "修改", import: "匯入", sample: "範例", "clear-sample": "清除範例",
   "confirm-draft": "確認入帳", "rename-project": "重新命名專案",
+  "delete": "刪除", "detach-transcript": "解除逐字稿來源",
 };
 
 let META = null;
@@ -184,6 +185,7 @@ function openNew() {
   $("#history-wrap").hidden = true;
   $("#origin-wrap").hidden = true;
   $("#doc-wrap").hidden = true;
+  $("#btn-delete-issue").hidden = true;
   $("#dlg-issue").showModal();
 }
 
@@ -226,6 +228,7 @@ async function openIssue(id) {
   }
   $("#history-wrap").hidden = false;
   $("#doc-wrap").hidden = false;
+  $("#btn-delete-issue").hidden = false;
   $("#doc-results").replaceChildren();
   $("#doc-msg").textContent = "";
   await loadDocLinks(id);
@@ -406,8 +409,10 @@ function importBody() {
 
 async function loadReparseTranscripts() {
   const sel = $("#reparse-transcript");
+  const list = $("#transcript-list");
   const projectId = $("#import-project").value;
   sel.replaceChildren(new Option("選擇已匯入的逐字稿", ""));
+  list.replaceChildren();
   if (!projectId) return;
   const data = await api("/api/transcripts?" + new URLSearchParams({ project_id: projectId }));
   for (const item of data.items) {
@@ -415,7 +420,20 @@ async function loadReparseTranscripts() {
       `${item.transcript_id}　${item.filename}　${item.format}　${item.timestamp_status}`,
       item.transcript_id,
     ));
+    const card = el("article", "", "card");
+    card.append(el("p", `${item.transcript_id}　${item.filename}　${item.segment_count} 段`));
+    const actions = el("div", "", "row-actions");
+    const pick = el("button", "選取");
+    pick.type = "button";
+    pick.addEventListener("click", () => { sel.value = item.transcript_id; });
+    const remove = el("button", "刪除此逐字稿", "danger");
+    remove.type = "button";
+    remove.addEventListener("click", () => deleteTranscript(item.transcript_id).catch((e) => showMsg(e.message, "error")));
+    actions.append(pick, remove);
+    card.append(actions);
+    list.append(card);
   }
+  if (!data.items.length) list.append(el("p", "這個專案還沒有匯入逐字稿。", "hint"));
 }
 
 async function openImport() {
@@ -638,7 +656,15 @@ function renderDraft(draft) {
     const drop = el("button", "捨棄");
     drop.type = "button";
     drop.addEventListener("click", () => discardDraft(draft.draft_id).catch((e) => showMsg(e.message, "error")));
-    actions.append(save, ok, drop);
+    const remove = el("button", "刪除", "danger");
+    remove.type = "button";
+    remove.addEventListener("click", () => deleteDraft(draft.draft_id));
+    actions.append(save, ok, drop, remove);
+  } else if (draft.review_status === "已捨棄") {
+    const remove = el("button", "刪除", "danger");
+    remove.type = "button";
+    remove.addEventListener("click", () => deleteDraft(draft.draft_id));
+    actions.append(remove);
   } else if (draft.issue_id) {
     actions.append(el("p", `已入帳：${draft.issue_id}`, "hint"));
   }
@@ -665,6 +691,130 @@ async function discardDraft(id) {
   showMsg(res.message);
   await reloadDrafts();
   await refresh();
+}
+
+function askDelete(title, body, buttons) {
+  $("#delete-title").textContent = title;
+  $("#delete-body").textContent = body;
+  const box = $("#delete-actions");
+  box.replaceChildren();
+  for (const spec of buttons) {
+    const button = el("button", spec.label, spec.danger ? "danger" : "");
+    button.type = "button";
+    button.addEventListener("click", () => {
+      $("#dlg-delete").close();
+      spec.onClick();
+    });
+    box.append(button);
+  }
+  $("#dlg-delete").showModal();
+}
+
+async function deleteTranscript(id) {
+  const plan = await api(`/api/transcripts/${encodeURIComponent(id)}/delete`, {
+    method: "POST", json: { preview: true },
+  });
+  const lines = [
+    plan.message,
+    "不會刪磁碟上的原始 TXT。",
+  ];
+  const buttons = [{ label: "取消，不刪除", onClick: () => {} }];
+  if (plan.confirmed_count || (plan.issue_ids || []).length) {
+    buttons.push({
+      label: "保留台帳並解除來源",
+      danger: true,
+      onClick: () => applyDeleteTranscript(id, "detach").catch((e) => showMsg(e.message, "error")),
+    });
+  } else {
+    buttons.push({
+      label: "刪除此逐字稿",
+      danger: true,
+      onClick: () => applyDeleteTranscript(id, "").catch((e) => showMsg(e.message, "error")),
+    });
+  }
+  askDelete("刪除此逐字稿", lines.join("\n"), buttons);
+}
+
+async function applyDeleteTranscript(id, ledger) {
+  const body = { confirm: true };
+  if (ledger) body.ledger = ledger;
+  const res = await api(`/api/transcripts/${encodeURIComponent(id)}/delete`, { method: "POST", json: body });
+  showMsg(res.message, res.deleted ? "" : "warn");
+  await loadReparseTranscripts();
+  await refresh();
+}
+
+function deleteDraft(id) {
+  askDelete(
+    "刪除草稿",
+    "刪除會拿掉這筆草稿，不會留下捨棄紀錄，也不會刪台帳或磁碟上的原始檔。",
+    [
+      { label: "取消", onClick: () => {} },
+      {
+        label: "刪除",
+        danger: true,
+        onClick: () => applyDeleteDraft(id).catch((e) => showMsg(e.message, "error")),
+      },
+    ],
+  );
+}
+
+async function applyDeleteDraft(id) {
+  const res = await api(`/api/drafts/${encodeURIComponent(id)}/delete`, { method: "POST", json: { confirm: true } });
+  showMsg(res.message);
+  await reloadDrafts();
+}
+
+function deleteIssue(id) {
+  askDelete(
+    "刪除事項",
+    `刪除事項 ${id}？變更紀錄會留下這次刪除。文件關聯只移除資料庫裡的連結，不會刪磁碟上的檔案。若此事項來自草稿，該草稿會回到未入帳。`,
+    [
+      { label: "取消", onClick: () => {} },
+      {
+        label: "刪除事項",
+        danger: true,
+        onClick: () => applyDeleteIssue(id).catch((e) => showMsg(e.message, "error")),
+      },
+    ],
+  );
+}
+
+async function applyDeleteIssue(id) {
+  const res = await api(`/api/issues/${encodeURIComponent(id)}/delete`, { method: "POST", json: { confirm: true } });
+  if ($("#dlg-issue").open) $("#dlg-issue").close();
+  showMsg(res.message);
+  await refresh();
+}
+
+function openWipe() {
+  $("#wipe-confirm").value = "";
+  $("#wipe-errors").hidden = true;
+  $("#btn-wipe-go").disabled = true;
+  $("#dlg-wipe").showModal();
+}
+
+async function applyWipe() {
+  const box = $("#wipe-errors");
+  box.hidden = true;
+  const typed = $("#wipe-confirm").value.trim();
+  if (typed !== META.clear_all_phrase) {
+    box.textContent = `請輸入「${META.clear_all_phrase}」`;
+    box.hidden = false;
+    return;
+  }
+  try {
+    const res = await api("/api/data/clear", { method: "POST", json: { confirm: typed } });
+    $("#dlg-wipe").close();
+    if ($("#dlg-import").open) $("#dlg-import").close();
+    if ($("#dlg-drafts").open) $("#dlg-drafts").close();
+    if ($("#dlg-issue").open) $("#dlg-issue").close();
+    showMsg(`${res.message}\n備份：${res.backup}`);
+    await refresh();
+  } catch (e) {
+    box.textContent = e.message;
+    box.hidden = false;
+  }
 }
 
 async function openRename() {
@@ -768,6 +918,15 @@ async function init() {
   $("#btn-sample-load").addEventListener("click", () => api("/api/sample/load", { method: "POST", json: {} })
     .then((r) => { showMsg(`已載入 ${r.loaded} 筆範例資料`); return refresh(); }).catch((e) => showMsg(e.message, "error")));
   $("#btn-sample-clear").addEventListener("click", clearSample);
+  $("#btn-wipe").addEventListener("click", openWipe);
+  $("#btn-wipe-cancel").addEventListener("click", () => $("#dlg-wipe").close());
+  $("#wipe-confirm").addEventListener("input", () => {
+    $("#btn-wipe-go").disabled = $("#wipe-confirm").value.trim() !== META.clear_all_phrase;
+  });
+  $("#btn-wipe-go").addEventListener("click", () => applyWipe());
+  $("#btn-delete-issue").addEventListener("click", () => {
+    if (state.editing) deleteIssue(state.editing);
+  });
   $("#import-project").addEventListener("change", () => loadReparseTranscripts().catch((e) => showMsg(e.message, "error")));
   $("#btn-reparse-preview").addEventListener("click", () => previewReparse().catch((e) => {
     const box = $("#import-errors");

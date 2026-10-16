@@ -600,3 +600,50 @@ def clear_sample(conn, operator):
         conn.execute(f"DELETE FROM document_links WHERE issue_id IN ({marks})", ids)
     conn.execute("DELETE FROM issues WHERE is_sample=1")
     return len(ids)
+
+
+def delete_issue(conn, issue_id, operator, *, now=None):
+    """刪除一筆台帳事項，並在變更紀錄留下刪除。不刪磁碟上的檔案。
+
+    若事項來自草稿，該草稿回到未入帳，逐字稿本身不刪。文件關聯只刪資料庫裡的連結。
+    """
+    issue = get_issue(conn, issue_id)
+    when = now or now_str()
+    _log(conn, issue_id, when, operator, "delete", "issue_id", issue_id, "")
+    _log(conn, issue_id, when, operator, "delete", "title", issue.get("title") or "", "")
+    link_count = conn.execute(
+        "SELECT COUNT(*) FROM document_links WHERE issue_id=?", (issue_id,)).fetchone()[0]
+    if link_count:
+        _log(conn, issue_id, when, operator, "delete", "document_links", str(link_count), "0")
+        conn.execute("DELETE FROM document_links WHERE issue_id=?", (issue_id,))
+    draft_id = issue.get("draft_id") or ""
+    draft_reverted = False
+    if draft_id:
+        cur = conn.execute(
+            """UPDATE drafts SET review_status='草稿', issue_id='', updated_at=?
+               WHERE draft_id=? AND issue_id=? AND review_status='已確認'""",
+            (when, draft_id, issue_id))
+        draft_reverted = cur.rowcount > 0
+        if draft_reverted:
+            _log(conn, issue_id, when, operator, "delete", "draft_id", draft_id, "")
+    conn.execute("DELETE FROM issues WHERE issue_id=?", (issue_id,))
+    return {
+        "deleted": True,
+        "issue_id": issue_id,
+        "draft_reverted": draft_reverted,
+        "links_removed": link_count,
+        "message": "已刪除事項，變更紀錄保留這次刪除。沒有刪除磁碟上的檔案。"
+        + ("相關草稿已回到未入帳。" if draft_reverted else ""),
+    }
+
+
+def wipe_all(conn):
+    """清空台帳、逐字稿、草稿與專案。呼叫端須先做好備份。不刪備份檔，也不碰磁碟上的原始 TXT。"""
+    counts = {}
+    for table in (
+        "document_links", "extraction_runs", "drafts", "transcript_segments",
+        "transcripts", "issues", "issue_history", "projects",
+    ):
+        counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        conn.execute(f"DELETE FROM {table}")
+    return counts
