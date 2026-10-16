@@ -6,3 +6,6 @@ config.json
 *.md.bak
 __pycache__/
 *.pyc
+# 本機真實驗收目錄與報告，即使被複製進工作區也不進版控
+sdt-verify/
+verify-reports/

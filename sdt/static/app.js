@@ -404,13 +404,69 @@ function importBody() {
   })));
 }
 
+async function loadReparseTranscripts() {
+  const sel = $("#reparse-transcript");
+  const projectId = $("#import-project").value;
+  sel.replaceChildren(new Option("選擇已匯入的逐字稿", ""));
+  if (!projectId) return;
+  const data = await api("/api/transcripts?" + new URLSearchParams({ project_id: projectId }));
+  for (const item of data.items) {
+    if (item.format !== "txt") continue;
+    sel.append(new Option(`${item.transcript_id}　${item.filename}　${item.timestamp_status}`, item.transcript_id));
+  }
+}
+
 async function openImport() {
   state.projects = (await api("/api/projects")).items;
   fillProjectSelect($("#import-project"), { selected: $("#f-project").value });
   $("#import-new-project").value = "";
   $("#import-errors").hidden = true;
   $("#import-preview").hidden = true;
+  $("#reparse-preview").hidden = true;
   $("#dlg-import").showModal();
+  await loadReparseTranscripts();
+}
+
+async function previewReparse() {
+  const box = $("#import-errors");
+  box.hidden = true;
+  const id = $("#reparse-transcript").value;
+  if (!id) {
+    box.textContent = "請選擇要重新解析的 TXT 逐字稿";
+    box.hidden = false;
+    return;
+  }
+  const res = await api(`/api/transcripts/${encodeURIComponent(id)}/reparse/preview`, { method: "POST", json: {} });
+  const lines = [
+    res.message,
+    `時間資訊：${res.timestamp_status}`,
+    res.timestamp_detail,
+    `完整時間 ${res.time_counts.complete}、只有開始時間 ${res.time_counts.start_only}、沒有時間 ${res.time_counts.no_time}、時間錯誤 ${res.time_counts.time_error}`,
+    `草稿 ${res.drafts.length} 筆、事項 ${res.issue_ids.length} 筆（預覽不會改審核狀態或原文）`,
+  ];
+  for (const change of res.changes.filter((c) => c.changed).slice(0, 12)) {
+    lines.push(`第 ${change.line} 行 ${change.segment_id}：${change.before.timestamp_label} → ${change.after.timestamp_label}`);
+  }
+  if (res.unmatched_existing.length) lines.push("對不上、因此不會刪除的段落：" + res.unmatched_existing.join("、"));
+  if (res.unmatched_new_lines.length) lines.push("原文裡尚未有段落、套用時只補段落不產生草稿的行：" + res.unmatched_new_lines.join("、"));
+  const pre = $("#reparse-preview");
+  pre.textContent = lines.join("\n");
+  pre.hidden = false;
+}
+
+async function applyReparse() {
+  const box = $("#import-errors");
+  box.hidden = true;
+  const id = $("#reparse-transcript").value;
+  if (!id) {
+    box.textContent = "請選擇要重新解析的 TXT 逐字稿";
+    box.hidden = false;
+    return;
+  }
+  const res = await api(`/api/transcripts/${encodeURIComponent(id)}/reparse`, { method: "POST", json: { confirm: true } });
+  showMsg(res.message);
+  await previewReparse();
+  await loadReparseTranscripts();
 }
 
 async function previewImport() {
@@ -426,6 +482,9 @@ async function previewImport() {
       `段落數：${res.segment_count}`,
       `時間資訊：${res.timestamp_status}`,
       res.timestamp_detail,
+      res.time_counts
+        ? `完整時間 ${res.time_counts.complete}、只有開始時間 ${res.time_counts.start_only}、沒有時間 ${res.time_counts.no_time}、時間錯誤 ${res.time_counts.time_error}`
+        : "",
       res.duplicate ? `相同內容已存在：${res.existing_transcript_id}，確認匯入不會重複建立。` : "尚未匯入過這份內容。",
       ...res.notes,
     ];
@@ -484,6 +543,16 @@ function renderDraft(draft) {
   card.append(el("h3", `${draft.draft_id}　${draft.kind}　${draft.review_status}`));
   card.append(el("p", draft.location_label, "hint"));
   card.append(el("p", `時間：${draft.timestamp_label}`, "hint"));
+  if (draft.rule_id || draft.reason) {
+    card.append(el("p", `規則 ${draft.rule_id || "—"}：${draft.reason || ""}`, "hint"));
+  }
+  if (draft.review_gaps) card.append(el("p", `需人工核對：${draft.review_gaps}`, "hint"));
+  const refs = Array.isArray(draft.context_refs) ? draft.context_refs : [];
+  for (const ref of refs) {
+    const id = ref.segment_id || ref.source_segment_id || "";
+    card.append(el("p", `上下文段落 ${id}　${ref.timestamp_label || ""}（沒有併進原始引用）`, "hint"));
+    card.append(el("pre", ref.text || "", "quote"));
+  }
   card.append(el("p", `負責人：${draft.owner || "（空）"}（${draft.owner_origin}）　期限：${draft.due_date || "（空）"}（${draft.due_origin}）`, "hint"));
   card.append(el("p", "原始引用（不會被摘要修改覆寫）"));
   card.append(el("pre", draft.source_quote, "quote"));
@@ -638,6 +707,17 @@ async function init() {
   $("#btn-sample-load").addEventListener("click", () => api("/api/sample/load", { method: "POST", json: {} })
     .then((r) => { showMsg(`已載入 ${r.loaded} 筆範例資料`); return refresh(); }).catch((e) => showMsg(e.message, "error")));
   $("#btn-sample-clear").addEventListener("click", clearSample);
+  $("#import-project").addEventListener("change", () => loadReparseTranscripts().catch((e) => showMsg(e.message, "error")));
+  $("#btn-reparse-preview").addEventListener("click", () => previewReparse().catch((e) => {
+    const box = $("#import-errors");
+    box.textContent = e.message;
+    box.hidden = false;
+  }));
+  $("#btn-reparse-apply").addEventListener("click", () => applyReparse().catch((e) => {
+    const box = $("#import-errors");
+    box.textContent = e.message;
+    box.hidden = false;
+  }));
   $("#btn-import").addEventListener("click", () => openImport().catch((e) => showMsg(e.message, "error")));
   $("#btn-import-close").addEventListener("click", () => $("#dlg-import").close());
   $("#btn-import-preview").addEventListener("click", () => previewImport());

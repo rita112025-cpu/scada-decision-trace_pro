@@ -119,6 +119,16 @@
     <label class="wide">檔案<input id="import-file" type="file" accept=".json,.txt,application/json,text/plain"></label>
   </div>
   <pre id="import-preview" class="quote" hidden></pre>
+  <section>
+    <h3>重新解析已匯入的 TXT 時間</h3>
+    <p class="hint">只更新對得上的行的時間與抽取用正文。原始行、草稿審核狀態、已入帳事項與原始引用都保留。不會因為重新解析而自動入帳。</p>
+    <div class="filters">
+      <select id="reparse-transcript"></select>
+      <button type="button" id="btn-reparse-preview">預覽重新解析</button>
+      <button type="button" id="btn-reparse-apply">套用重新解析</button>
+    </div>
+    <pre id="reparse-preview" class="quote" hidden></pre>
+  </section>
   <div id="import-errors" class="msg error" hidden></div>
   <div class="dlg-actions">
     <button type="button" id="btn-import-close">關閉</button>

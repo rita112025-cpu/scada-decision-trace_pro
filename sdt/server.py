@@ -229,6 +229,15 @@ def make_handler(app):
                         conn, project_id=data.get("project_id", ""), filename=data.get("filename", ""),
                         content_base64=data.get("content_base64", ""), operator=app.cfg.operator)
                 return self._json(200, result)
+            if route == ("POST", "transcripts") and parts[1:2] != ["preview"] and parts[2:] == ["reparse", "preview"]:
+                with app.conn() as conn:
+                    return self._json(200, transcripts.reparse_preview(conn, parts[1]))
+            if route == ("POST", "transcripts") and parts[2:] == ["reparse"]:
+                data = self._json_body()
+                if data.get("confirm") is not True:
+                    raise db.ValidationError(["請先預覽重新解析，確認後再套用"])
+                with app.lock, app.conn() as conn:
+                    return self._json(200, transcripts.reparse_apply(conn, parts[1]))
             if route == ("GET", "transcripts") and len(parts) == 1:
                 with app.conn() as conn:
                     return self._json(200, {"items": transcripts.list_transcripts(conn, query.get("project_id", ""))})

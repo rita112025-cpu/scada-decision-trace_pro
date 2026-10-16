@@ -135,6 +135,10 @@ CREATE TABLE IF NOT EXISTS drafts (
     due_origin TEXT NOT NULL DEFAULT '未指定',
     review_status TEXT NOT NULL,
     issue_id TEXT NOT NULL DEFAULT '',
+    rule_id TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    review_gaps TEXT NOT NULL DEFAULT '',
+    context_refs TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -191,6 +195,10 @@ def migrate(conn):
     link_cols = _table_columns(conn, "document_links")
     if "file_hash" not in link_cols:
         conn.execute("ALTER TABLE document_links ADD COLUMN file_hash TEXT NOT NULL DEFAULT ''")
+    draft_cols = _table_columns(conn, "drafts")
+    for col in ("rule_id", "reason", "review_gaps", "context_refs"):
+        if col not in draft_cols:
+            conn.execute(f"ALTER TABLE drafts ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id)")
     # 依既有「專案」文字歸入穩定 ID。名稱相同的列共用一個專案；空白名稱也保留為一筆。
     names = [r["project"] for r in conn.execute("SELECT DISTINCT project FROM issues")]
