@@ -7,7 +7,7 @@ import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import agenda, backup, csvio, db, sample
+from . import agenda, backup, csvio, db, notebook, sample, transcripts
 
 STATIC_DIR = pathlib.Path(__file__).resolve().parent / "static"
 CLEAR_SAMPLE_PHRASE = "清除範例資料"
@@ -99,10 +99,12 @@ def make_handler(app):
                 return self._api(method, parts[1:], query)
             except db.ValidationError as e:
                 self._json(400, {"errors": e.errors})
+            except notebook.NotebookUnavailable as e:
+                self._json(503, {"errors": e.errors})
             except ValueError as e:  # 備份／還原的已知錯誤，訊息不含路徑
                 self._json(400, {"errors": [str(e)]})
-            except db.NotFound:
-                self._json(404, {"errors": ["找不到此事項"]})
+            except db.NotFound as e:
+                self._json(404, {"errors": [e.message]})
             except Exception:
                 # 詳細堆疊只印在本機主控台，不回傳給瀏覽器
                 traceback.print_exc()
@@ -126,15 +128,21 @@ def make_handler(app):
                     "issue_types": db.ISSUE_TYPES, "source_statuses": db.SOURCE_STATUSES,
                     "priorities": db.PRIORITIES, "statuses": db.STATUSES,
                     "acceptance_results": db.ACCEPTANCE_RESULTS, "views": db.VIEWS,
-                    "clear_sample_phrase": CLEAR_SAMPLE_PHRASE})
+                    "clear_sample_phrase": CLEAR_SAMPLE_PHRASE,
+                    "extraction_method": transcripts.EXTRACTION_METHOD,
+                    "extraction_limitation": transcripts.LIMITATION,
+                    "draft_statuses": ["草稿", "已確認", "已捨棄"],
+                    "link_endorsement": "未主張支持"})
             if route == ("GET", "issues") and len(parts) == 1:
                 with app.conn() as conn:
                     filters = {k: query.get(k, "") for k in
                                ("issue_type", "source_status", "priority", "status", "owner", "project")}
+                    if query.get("project_id"):
+                        filters["project_id"] = query["project_id"]
                     items = db.list_issues(conn, view=query.get("view", "all"), q=query.get("q", ""),
                                            filters=filters, sort=query.get("sort", "due_date"),
                                            order=query.get("order", "asc"), today=today)
-                    counts = db.view_counts(conn, today)
+                    counts = db.view_counts(conn, today, project_id=query.get("project_id", ""))
                     has_sample = bool(conn.execute("SELECT 1 FROM issues WHERE is_sample=1").fetchone())
                 return self._json(200, {"items": items, "counts": counts, "has_sample": has_sample})
             if route == ("GET", "issues") and len(parts) == 3 and parts[2] == "history":
@@ -143,7 +151,9 @@ def make_handler(app):
                     return self._json(200, {"items": db.get_history(conn, parts[1])})
             if route == ("GET", "issues") and len(parts) == 2:
                 with app.conn() as conn:
-                    return self._json(200, db.get_issue(conn, parts[1]))
+                    issue = db.get_issue(conn, parts[1])
+                    issue["project_locked"] = db.project_move_blocked(conn, issue)
+                    return self._json(200, issue)
             if route == ("POST", "issues") and len(parts) == 1:
                 data = self._json_body()
                 with app.lock, app.conn() as conn:
@@ -191,6 +201,93 @@ def make_handler(app):
                     with app.conn() as conn:
                         n = db.clear_sample(conn, app.cfg.operator)
                 return self._json(200, {"cleared": n, "backup": pre.name})
+            if route == ("GET", "projects") and len(parts) == 1:
+                with app.conn() as conn:
+                    return self._json(200, {"items": db.list_projects(conn)})
+            if route == ("POST", "projects") and len(parts) == 1:
+                data = self._json_body()
+                with app.lock, app.conn() as conn:
+                    proj = db.create_project(conn, data.get("name", ""))
+                return self._json(201, {"project": proj})
+            if route == ("PUT", "projects") and len(parts) == 2:
+                data = self._json_body()
+                with app.lock, app.conn() as conn:
+                    proj = db.rename_project(conn, parts[1], data.get("name", ""), app.cfg.operator)
+                return self._json(200, {"project": proj})
+            if route == ("POST", "transcripts") and parts[1:] == ["preview"]:
+                data = self._json_body()
+                with app.conn() as conn:
+                    return self._json(200, transcripts.preview_payload(
+                        conn, project_id=data.get("project_id", ""), filename=data.get("filename", ""),
+                        content_base64=data.get("content_base64", "")))
+            if route == ("POST", "transcripts") and parts[1:] == ["import"]:
+                data = self._json_body()
+                if data.get("confirm") is not True:
+                    raise db.ValidationError(["請先預覽，確認後再匯入"])
+                with app.lock, app.conn() as conn:
+                    result = transcripts.import_transcript(
+                        conn, project_id=data.get("project_id", ""), filename=data.get("filename", ""),
+                        content_base64=data.get("content_base64", ""), operator=app.cfg.operator)
+                return self._json(200, result)
+            if route == ("GET", "transcripts") and len(parts) == 1:
+                with app.conn() as conn:
+                    return self._json(200, {"items": transcripts.list_transcripts(conn, query.get("project_id", ""))})
+            if route == ("GET", "transcripts") and len(parts) == 3 and parts[2] == "segments":
+                with app.conn() as conn:
+                    return self._json(200, {"items": transcripts.list_segments(conn, parts[1])})
+            if route == ("GET", "transcripts") and len(parts) == 4 and parts[2] == "segments":
+                with app.conn() as conn:
+                    return self._json(200, transcripts.get_segment(conn, parts[1], parts[3]))
+            if route == ("GET", "transcripts") and len(parts) == 2:
+                with app.conn() as conn:
+                    item = transcripts.get_transcript(conn, parts[1])
+                    item.pop("raw_text", None)
+                    return self._json(200, item)
+            if route == ("GET", "drafts") and len(parts) == 1:
+                with app.conn() as conn:
+                    return self._json(200, {"items": transcripts.list_drafts(
+                        conn, project_id=query.get("project_id", ""), status=query.get("status", ""),
+                        transcript_id=query.get("transcript_id", ""))})
+            if route == ("GET", "drafts") and len(parts) == 2:
+                with app.conn() as conn:
+                    return self._json(200, transcripts.get_draft(conn, parts[1]))
+            if route == ("PUT", "drafts") and len(parts) == 2:
+                data = self._json_body()
+                with app.lock, app.conn() as conn:
+                    return self._json(200, {"draft": transcripts.update_draft(conn, parts[1], data)})
+            if route == ("POST", "drafts") and len(parts) == 3 and parts[2] == "confirm":
+                with app.lock, app.conn() as conn:
+                    return self._json(200, transcripts.confirm_draft(conn, parts[1], app.cfg.operator))
+            if route == ("POST", "drafts") and len(parts) == 3 and parts[2] == "discard":
+                with app.lock, app.conn() as conn:
+                    return self._json(200, transcripts.discard_draft(conn, parts[1]))
+            if route == ("GET", "notebook") and parts[1:] == ["status"]:
+                return self._json(200, notebook.status(app.cfg.local_notebook_url, app.cfg.local_notebook_db))
+            if route == ("GET", "notebook") and parts[1:] == ["notebooks"]:
+                return self._json(200, {"items": notebook.list_notebooks(app.cfg.local_notebook_url)})
+            if route == ("GET", "notebook") and parts[1:] == ["search"]:
+                return self._json(200, notebook.search(
+                    app.cfg.local_notebook_url, query.get("notebook", ""), query.get("q", ""),
+                    query.get("limit", 20)))
+            if route == ("GET", "issues") and len(parts) == 3 and parts[2] == "links":
+                with app.conn() as conn:
+                    return self._json(200, {"items": notebook.list_links(conn, parts[1]),
+                                            "endorsement": "未主張支持"})
+            if route == ("POST", "issues") and len(parts) == 3 and parts[2] == "links":
+                data = self._json_body()
+                with app.lock, app.conn() as conn:
+                    result = notebook.create_link(
+                        conn, parts[1], data.get("hit") or data,
+                        notebook_db=app.cfg.local_notebook_db)
+                return self._json(201 if result["created"] else 200, result)
+            if route == ("POST", "links") and len(parts) == 3 and parts[2] == "locate":
+                with app.conn() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM document_links WHERE link_id=?", (parts[1],)).fetchone()
+                    if row is None:
+                        raise db.NotFound(parts[1], "找不到此文件關聯")
+                    link = dict(row)
+                return self._json(200, notebook.locate_link(app.cfg.local_notebook_db, link))
             if route == ("POST", "shutdown"):
                 self._json(200, {"ok": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
