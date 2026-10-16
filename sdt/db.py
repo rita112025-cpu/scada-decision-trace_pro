@@ -222,13 +222,22 @@ def migrate(conn):
             (pid, name))
 
 
+# 結構有變就加 1。已是這個版本的資料庫不再每次連線都跑建表與遷移。
+SCHEMA_VERSION = 1
+
+
 def connect(path):
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(SCHEMA)
-    migrate(conn)
-    conn.commit()
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA journal_mode=WAL").fetchone()
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < SCHEMA_VERSION:
+        conn.executescript(SCHEMA)
+        migrate(conn)
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.commit()
     return conn
 
 
@@ -334,15 +343,28 @@ def _next_issue_id(conn):
 
 
 def next_public_id(conn, table, column, prefix):
-    """不可變編號。只掃描指定資料表的既有編號，不重用已發出的 ID。"""
-    best = 0
-    for row in conn.execute(f"SELECT {column} FROM {table}"):
-        val = row[0]
-        if isinstance(val, str) and val.startswith(prefix):
-            tail = val[len(prefix):]
-            if tail.isdigit():
-                best = max(best, int(tail))
-    return f"{prefix}{best + 1:04d}"
+    """不可變編號。用最大編號加一，不重用、不掃整表。格式仍是前綴加至少四位數字。"""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table or ""):
+        raise db_identifier_error()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column or ""):
+        raise db_identifier_error()
+    if not prefix:
+        raise db_identifier_error()
+    start = len(prefix) + 1
+    row = conn.execute(
+        f"""SELECT MAX(CAST(substr({column}, ?) AS INTEGER))
+            FROM {table}
+            WHERE {column} GLOB ?
+              AND length(substr({column}, ?)) > 0
+              AND substr({column}, ?) NOT GLOB '*[^0-9]*'""",
+        (start, prefix + "[0-9]*", start, start),
+    ).fetchone()
+    best = row[0] or 0
+    return f"{prefix}{int(best) + 1:04d}"
+
+
+def db_identifier_error():
+    return ValidationError(["編號欄位無效"])
 
 
 def list_projects(conn):

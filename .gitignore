@@ -2,6 +2,8 @@
 data/
 config.json
 *.db
+*.db-wal
+*.db-shm
 *.csv
 *.md.bak
 __pycache__/

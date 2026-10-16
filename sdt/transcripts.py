@@ -15,12 +15,16 @@ from . import db
 
 RULE_V2 = "rule:v2"
 RULE_V3 = "rule:v3"
-EXTRACTION_METHOD = RULE_V3
+RULE_V4 = "rule:v4"
+EXTRACTION_METHOD = RULE_V4
 LIMITATION = (
     "能力限制：此環境沒有可用的既有抽取器，也未呼叫外部 API 或下載模型。"
     "草稿只是可人工審核的候選，不是對會議的自動理解。"
-    "目前抽取版本是 rule:v3。明文標記（決議：、定案、決定採用、待辦、請＋姓名＋動作）仍沿用 rule:v2，信心標為高。"
-    "另外收錄一部分台灣口語定案與交辦說法，信心標為中；本機說法清單對上的標為低。"
+    "目前抽取版本是 rule:v4。明文標記（決議：、定案、決定採用、待辦、請＋姓名＋動作）仍沿用 rule:v2，信心標為高。"
+    "口語定案與交辦信心標為中；本機說法清單對上的標為低。"
+    "「麻煩」要後面接著對象和動作（例如確認、提供、回覆、更新、補）才列為待辦。"
+    "談預算、報價、費用，以及「但是麻煩」這種有條件的請求，不列為待辦。"
+    "「你們先」也要接著動作；「那就這樣」若在談價錢或帶著「但是」，不當成定案。"
     "問句、假設、建議、否定、取消，以及「核准過」「之前已經」這類過去的事，不列為候選。"
     "「然後就是核准過的版本」這種歷史敘述不是這次的決議。很短的應聲（對、嗯、好、OK）也不列。"
     "負責人與期限只有這一句明文寫出才填，不依講者或前後文猜測。"
@@ -612,8 +616,23 @@ _V3_GUARD = re.compile(
     r"之前就|以前就|先前就|早就|已經決定過|決定過了|曾經核准|過了"
 )
 _COLLOQUIAL_OWNER = (
-    re.compile(rf"麻煩(?P<name>{_NAME})(?=回去|再|先|幫|確認|提供|補|看|處理|整理|追蹤|於)"),
-    re.compile(rf"請(?P<name>{_NAME})(?=回去|再|先|幫)"),
+    re.compile(
+        rf"麻煩(?P<name>{_NAME})(?=回去|再|先|幫|確認|提供|回覆|更新|補|看|處理|整理|追蹤|列出|於)"
+    ),
+    re.compile(rf"請(?P<name>{_NAME})(?=回去|再|先|幫|回覆|更新)"),
+)
+_GROUP_ADDRESS = {"你", "你們", "各位", "貴司", "廠商", "我們", "大家", "他們"}
+_MONEY = re.compile(r"預算|報價|價格|價錢|費用|價金|金額|付款|請款|議價|折扣|成本")
+_HEDGE = re.compile(r"但是|不過|可是")
+_CONDITIONAL_ASK = re.compile(r"(?:但是|不過|可是|但)(?:你們先|麻煩)")
+_ACTION = (
+    "回去確認|列出來|確認|提供|回覆|更新|補上|補充|補給|整理|處理|追蹤|修改|修正|繪製|完成|列出|核對|補"
+)
+_TROUBLE_V4 = re.compile(
+    rf"麻煩(?:你們|各位|貴司|廠商|你|[\u4e00-\u9fff]{{2,4}})[^。！？!?]{{0,40}}?(?:{_ACTION})"
+)
+_YOU_FIRST_V4 = re.compile(
+    rf"你們先(?:把|再|去|幫)?[^。！？!?]{{0,24}}?(?:{_ACTION})"
 )
 
 
@@ -633,25 +652,46 @@ def _colloquial_blocked(sentence):
     return _V3_GUARD.search(sentence) is not None
 
 
-def _decision_cue(sentence):
+def _matches_decision_cue(sentence, cue):
+    if cue == "OK那就":
+        return re.search(r"(?i)ok那就", sentence) is not None
+    if cue == "確定用" and "確定用戶" in sentence:
+        return False
+    return cue in sentence
+
+
+def _decision_cue(sentence, *, tightened=False):
     for cue in _DECISION_CUES:
-        if cue == "OK那就":
-            if re.search(r"(?i)ok那就", sentence):
-                return cue
+        if tightened and cue == "那就這樣" and (_MONEY.search(sentence) or _HEDGE.search(sentence)):
             continue
-        if cue == "確定用" and "確定用戶" in sentence:
-            continue
-        if cue in sentence:
+        if _matches_decision_cue(sentence, cue):
             return cue
     return ""
 
 
-def _todo_cue(sentence):
+def _todo_cue(sentence, *, tightened=False):
+    """rule:v3 的「麻煩」「你們先」較寬。rule:v4 要有對象與動作，並排除議價與有條件的請求。"""
     for cue in _TODO_CUES:
         if cue == "麻煩":
             if re.search(r"(?:比較|很|太|有點|真|稍|不)麻煩", sentence):
                 continue
+            if tightened:
+                if _CONDITIONAL_ASK.search(sentence) or _MONEY.search(sentence):
+                    continue
+                if _TROUBLE_V4.search(sentence):
+                    return cue
+                continue
             if re.search(r"麻煩.{2,}", sentence):
+                return cue
+            continue
+        if cue == "你們先":
+            if tightened:
+                if _CONDITIONAL_ASK.search(sentence) or _MONEY.search(sentence):
+                    continue
+                if _YOU_FIRST_V4.search(sentence):
+                    return cue
+                continue
+            if cue in sentence:
                 return cue
             continue
         if cue == "我們這邊會" and "會不會" in sentence:
@@ -703,7 +743,7 @@ def extract_owner_explicit(sentence):
         if not matched:
             continue
         found = matched.group("name")
-        if any(part in found for part in _NAME_BAD_PARTS):
+        if found in _GROUP_ADDRESS or any(part in found for part in _NAME_BAD_PARTS):
             continue
         if found not in sentence:
             continue
@@ -742,7 +782,7 @@ def _spoken_hit(kind, rule_id, cue, confidence, source, also_todo):
 
 
 def _classify_candidate(sentence, method, extra_cues):
-    """rule:v2 只看明文標記。rule:v3 在同一套標記之後才收口語，並先套防護。"""
+    """rule:v2 只看明文標記。rule:v3／v4 在同一套標記之後才收口語。v4 再收緊寬說法。"""
     decision = _decision_rule(sentence)
     todo = _todo_rule(sentence)
     if decision:
@@ -758,8 +798,9 @@ def _classify_candidate(sentence, method, extra_cues):
         return _explicit_hit("待辦", rule_id, reason, False)
     if _colloquial_blocked(sentence):
         return None
-    cue = _decision_cue(sentence)
-    todo_cue = _todo_cue(sentence)
+    tightened = method == RULE_V4
+    cue = _decision_cue(sentence, tightened=tightened)
+    todo_cue = _todo_cue(sentence, tightened=tightened)
     local_decision = _local_cue(sentence, (extra_cues or {}).get("decisions"))
     local_todo = _local_cue(sentence, (extra_cues or {}).get("todos"))
     if cue:
@@ -805,13 +846,13 @@ def extract_candidates(segments, method=None, extra_cues=None):
     """由段落產生候選草稿。同一句最多一筆；不會把草稿寫進正式台帳。
 
     前後段只在本句已有候選、且出現指代時附上，用來給人核對。不用前後段多收草稿，
-    也不把多段原文接成一句。method 可指定 rule:v2，用來重現舊版明文規則；
-    省略時用 rule:v3。extra_cues 只在 v3 生效，問句與歷史敘述仍然先被擋下。
+    也不把多段原文接成一句。    method 可指定 rule:v2 或 rule:v3，用來重現舊版；省略時用 rule:v4。
+    extra_cues 只在 v3／v4 生效，問句與歷史敘述仍然先被擋下。
     """
     method = method or EXTRACTION_METHOD
-    if method not in {RULE_V2, RULE_V3}:
+    if method not in {RULE_V2, RULE_V3, RULE_V4}:
         raise db.ValidationError([f"未知的抽取版本 {method}"])
-    cues = extra_cues if method == RULE_V3 else None
+    cues = None if method == RULE_V2 else extra_cues
     ordered = list(segments)
     found = []
     seen = set()

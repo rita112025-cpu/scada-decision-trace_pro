@@ -155,7 +155,11 @@ def main(argv=None):
     s = sub.add_parser("agenda", help="產生議程草稿 Markdown")
     s.add_argument("--out")
     args = p.parse_args(argv)
-    cfg = config.load(args.config)
+    try:
+        cfg = config.load(args.config)
+    except config.ConfigError as exc:
+        print(f"錯誤：{exc}")
+        return 1
     try:
         return _run(cfg, args)
     except ValueError as e:

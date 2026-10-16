@@ -1,6 +1,8 @@
 """CSV 匯入／匯出。匯出用 UTF-8 BOM，讓中文 Windows Excel 直接開啟不亂碼。"""
 import csv
+import datetime as dt
 import io
+import re
 
 from . import db
 
@@ -79,6 +81,31 @@ def parse(data):
     return rows
 
 
+_CREATED_AT = re.compile(
+    r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$"
+)
+
+
+def _normalize_created_at(value):
+    """空的用現在時間。寫進台帳前先擋下不是日期的值。"""
+    text = (value or "").strip()
+    if not text:
+        return None
+    matched = _CREATED_AT.match(text)
+    if not matched:
+        raise db.ValidationError([f"建立時間「{text}」格式錯誤，請用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS"])
+    try:
+        day = dt.date(int(matched[1]), int(matched[2]), int(matched[3]))
+    except ValueError:
+        raise db.ValidationError([f"建立時間「{text}」不是有效日期，請用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS"])
+    if matched[4] is None:
+        return f"{day.isoformat()} 00:00:00"
+    hour, minute, second = int(matched[4]), int(matched[5]), int(matched[6] or 0)
+    if hour > 23 or minute > 59 or second > 59:
+        raise db.ValidationError([f"建立時間「{text}」不是有效時間，請用 YYYY-MM-DD HH:MM:SS"])
+    return f"{day.isoformat()} {hour:02d}:{minute:02d}:{second:02d}"
+
+
 def import_issues(conn, data, operator, now=None):
     """全部驗證通過才寫入；任一列錯誤就整批不匯入。issue_id 已存在 → 更新，否則新增。"""
     rows = parse(data)
@@ -94,6 +121,7 @@ def import_issues(conn, data, operator, now=None):
                     continue
                 seen.add(issue_id)
             try:
+                created_at = _normalize_created_at(row.get("created_at"))
                 exists = issue_id and conn.execute(
                     "SELECT 1 FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
                 if exists:
@@ -101,7 +129,6 @@ def import_issues(conn, data, operator, now=None):
                     _, w, diff = db.update_issue(conn, issue_id, changes, operator, now=now, action="import")
                     updated += bool(diff)
                 else:
-                    created_at = (row.get("created_at") or "").strip() or None
                     _, w = db.create_issue(conn, row, operator, now=now, action="import",
                                            issue_id=issue_id or None, created_at=created_at)
                     created += 1

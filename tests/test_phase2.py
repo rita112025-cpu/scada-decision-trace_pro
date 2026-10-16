@@ -459,7 +459,7 @@ class TestReextract(Base):
         self.assertFalse(preview["applied"])
         self.assertEqual(preview["added_count"], 0)
         self.assertEqual(preview["skipped_count"], len(before_ids))
-        self.assertEqual(preview["extraction_method"], "rule:v3")
+        self.assertEqual(preview["extraction_method"], "rule:v4")
         self.assertEqual(preview["runs"], [])
         self.assertIn("尚未寫入", preview["message"])
         self.assertEqual(sorted(d["draft_id"] for d in transcripts.list_drafts(
@@ -467,7 +467,7 @@ class TestReextract(Base):
         first = transcripts.reextract_apply(self.conn, tid)
         self.assertTrue(first["applied"])
         self.assertEqual(first["added_count"], 0)
-        self.assertEqual(first["extraction_method"], "rule:v3")
+        self.assertEqual(first["extraction_method"], "rule:v4")
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["summary"], "人工改寫的虛構摘要")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["review_status"], "已確認")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["source_quote"], quote)
@@ -489,7 +489,7 @@ class TestReextract(Base):
         created = transcripts.get_draft(self.conn, applied["added_draft_ids"][0])
         self.assertEqual(created["review_status"], "草稿")
         self.assertEqual(created["sentence_index"], "2")
-        self.assertEqual(created["extraction_method"], "rule:v3")
+        self.assertEqual(created["extraction_method"], "rule:v4")
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["summary"], "人工改寫的虛構摘要")
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["sentence_index"], "1")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["source_quote"], quote)
@@ -502,9 +502,9 @@ class TestReextract(Base):
             "SELECT extraction_method, added_count, skipped_count FROM extraction_runs WHERE transcript_id=? ORDER BY run_id",
             (tid,)).fetchall()
         self.assertEqual([tuple(r) for r in runs], [
-            ("rule:v3", 0, len(before_ids)),
-            ("rule:v3", 1, len(before_ids)),
-            ("rule:v3", 0, len(before_ids) + 1),
+            ("rule:v4", 0, len(before_ids)),
+            ("rule:v4", 1, len(before_ids)),
+            ("rule:v4", 0, len(before_ids) + 1),
         ])
         draft_count = len(transcripts.list_drafts(self.conn, project_id=proj["project_id"], transcript_id=tid))
         transcripts.reparse_apply(self.conn, tid)
@@ -907,7 +907,7 @@ class TestSpokenRules(Base):
                 key,
             )
             self.assertFalse(cand["source_quote"].startswith("["))
-            self.assertEqual(cand["extraction_method"], "rule:v3")
+            self.assertEqual(cand["extraction_method"], "rule:v4")
             if cand["confidence"] != "高":
                 self.assertIn(cand["cue"], cand["reason"])
         self.assertEqual(by_pos[("18", 1)]["source_quote"], "那就這樣。")
@@ -918,8 +918,41 @@ class TestSpokenRules(Base):
         self.assertNotIn("比較麻煩", adopted["source_quote"])
         v2 = transcripts.extract_candidates(parsed["segments"], method="rule:v2")
         self.assertEqual([c["source_quote"] for c in v2], ["決議：本次採用合成備援盤。"])
+        for quote in (
+            "我可以幫你弄，但是麻煩你多給一點預算。",
+            "麻煩你多給一點費用。",
+            "你們先報個價就好。",
+            "預算那就這樣算了。",
+        ):
+            self.assertNotIn(quote, [c["source_quote"] for c in found])
+
+    def test_v4_drops_negotiation_and_keeps_real_assignments(self):
+        def one(text, method=None):
+            return transcripts.extract_candidates(
+                [{"source_segment_id": "1", "text": text, "location_label": "第 1 行"}],
+                method=method,
+            )
+        budget = "我可以幫你弄，但是麻煩你多給一點預算。"
+        old = one(budget, "rule:v3")
+        self.assertEqual([c["cue"] for c in old], ["麻煩"])
+        self.assertEqual(one(budget, "rule:v4"), [])
+        self.assertEqual(one("麻煩你多給一點費用。"), [])
+        self.assertEqual(one("你們先報個價就好。"), [])
+        self.assertEqual([c["cue"] for c in one("你們先報個價就好。", "rule:v3")], ["你們先"])
+        self.assertEqual(one("預算那就這樣算了。"), [])
+        self.assertEqual([c["cue"] for c in one("預算那就這樣算了。", "rule:v3")], ["那就這樣"])
+        self.assertEqual(one("那就這樣，但是畫面再改。"), [])
+        asked = one("麻煩你們確認虛構點位。")
+        self.assertEqual((asked[0]["kind"], asked[0]["cue"], asked[0]["owner"], asked[0]["confidence"]),
+                         ("待辦", "麻煩", "", "中"))
+        named = one("麻煩陳假設回覆端子對照。")
+        self.assertEqual((named[0]["owner"], named[0]["due_date"], named[0]["cue"]), ("陳假設", "", "麻煩"))
+        kept = one("你們先把連鎖條件列出來。")
+        self.assertEqual(kept[0]["cue"], "你們先")
+        decided = one("嗯那就這樣，通訊模組就放在虛構盤右側。")
+        self.assertEqual((decided[0]["cue"], decided[0]["confidence"]), ("那就這樣", "中"))
         blocked = "然後就是核准過的版本。"
-        self.assertNotIn(blocked, [c["source_quote"] for c in found])
+        self.assertEqual(one(blocked), [])
         still = transcripts.extract_candidates(
             [{"source_segment_id": "1", "text": blocked, "location_label": "第 1 行"}],
             extra_cues={"decisions": ["核准過的版本"], "todos": []},
@@ -1001,8 +1034,8 @@ class TestSpokenRules(Base):
             self.assertEqual(proc.stdout, "\n".join([
                 "status=0",
                 "files=1",
-                "segments=44",
-                "sentences=46",
+                "segments=48",
+                "sentences=50",
                 "parse_warnings=0",
                 "candidates=19",
                 "decisions=11",
