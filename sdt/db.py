@@ -140,6 +140,8 @@ CREATE TABLE IF NOT EXISTS drafts (
     review_gaps TEXT NOT NULL DEFAULT '',
     context_refs TEXT NOT NULL DEFAULT '',
     sentence_index TEXT NOT NULL DEFAULT '',
+    cue TEXT NOT NULL DEFAULT '',
+    confidence TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -207,7 +209,7 @@ def migrate(conn):
     if "file_hash" not in link_cols:
         conn.execute("ALTER TABLE document_links ADD COLUMN file_hash TEXT NOT NULL DEFAULT ''")
     draft_cols = _table_columns(conn, "drafts")
-    for col in ("rule_id", "reason", "review_gaps", "context_refs", "sentence_index"):
+    for col in ("rule_id", "reason", "review_gaps", "context_refs", "sentence_index", "cue", "confidence"):
         if col not in draft_cols:
             conn.execute(f"ALTER TABLE drafts ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id)")

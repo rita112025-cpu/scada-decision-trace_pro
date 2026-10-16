@@ -459,7 +459,7 @@ class TestReextract(Base):
         self.assertFalse(preview["applied"])
         self.assertEqual(preview["added_count"], 0)
         self.assertEqual(preview["skipped_count"], len(before_ids))
-        self.assertEqual(preview["extraction_method"], "rule:v2")
+        self.assertEqual(preview["extraction_method"], "rule:v3")
         self.assertEqual(preview["runs"], [])
         self.assertIn("尚未寫入", preview["message"])
         self.assertEqual(sorted(d["draft_id"] for d in transcripts.list_drafts(
@@ -467,7 +467,7 @@ class TestReextract(Base):
         first = transcripts.reextract_apply(self.conn, tid)
         self.assertTrue(first["applied"])
         self.assertEqual(first["added_count"], 0)
-        self.assertEqual(first["extraction_method"], "rule:v2")
+        self.assertEqual(first["extraction_method"], "rule:v3")
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["summary"], "人工改寫的虛構摘要")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["review_status"], "已確認")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["source_quote"], quote)
@@ -489,7 +489,7 @@ class TestReextract(Base):
         created = transcripts.get_draft(self.conn, applied["added_draft_ids"][0])
         self.assertEqual(created["review_status"], "草稿")
         self.assertEqual(created["sentence_index"], "2")
-        self.assertEqual(created["extraction_method"], "rule:v2")
+        self.assertEqual(created["extraction_method"], "rule:v3")
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["summary"], "人工改寫的虛構摘要")
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["sentence_index"], "1")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["source_quote"], quote)
@@ -502,9 +502,9 @@ class TestReextract(Base):
             "SELECT extraction_method, added_count, skipped_count FROM extraction_runs WHERE transcript_id=? ORDER BY run_id",
             (tid,)).fetchall()
         self.assertEqual([tuple(r) for r in runs], [
-            ("rule:v2", 0, len(before_ids)),
-            ("rule:v2", 1, len(before_ids)),
-            ("rule:v2", 0, len(before_ids) + 1),
+            ("rule:v3", 0, len(before_ids)),
+            ("rule:v3", 1, len(before_ids)),
+            ("rule:v3", 0, len(before_ids) + 1),
         ])
         draft_count = len(transcripts.list_drafts(self.conn, project_id=proj["project_id"], transcript_id=tid))
         transcripts.reparse_apply(self.conn, tid)
@@ -854,3 +854,172 @@ class TestHeaderRangeParse(unittest.TestCase):
             self.assertIn("candidates=2", proc.stdout)
             self.assertNotIn("超出範圍", proc.stdout + proc.stderr)
             self.assertNotIn("fictional-warning", proc.stdout + proc.stderr)
+
+
+class TestSpokenRules(Base):
+    def test_v2_match_set_stays_reproducible(self):
+        text = (EXAMPLES / "meeting-colloquial.txt").read_text(encoding="utf-8")
+        parsed = transcripts.parse_upload("meeting-colloquial.txt", text)
+        v2 = transcripts.extract_candidates(parsed["segments"], method="rule:v2")
+        v3 = transcripts.extract_candidates(parsed["segments"], method="rule:v3")
+        self.assertEqual(
+            [(c["rule_id"], c["source_quote"]) for c in v2],
+            [(c["rule_id"], c["source_quote"]) for c in v3],
+        )
+        self.assertTrue(all(c["confidence"] == "高" and c["extraction_method"] == "rule:v2" for c in v2))
+        spoken = [{"source_segment_id": "1", "text": "我們就採用合成備援盤。", "location_label": "第 1 行"}]
+        self.assertEqual(transcripts.extract_candidates(spoken, method="rule:v2"), [])
+        hit = transcripts.extract_candidates(spoken, method="rule:v3")[0]
+        self.assertEqual((hit["rule_id"], hit["cue"], hit["confidence"]), ("D7", "我們就採用", "中"))
+
+    def test_colloquial_positives_and_guards(self):
+        text = (EXAMPLES / "meeting-spoken.txt").read_text(encoding="utf-8")
+        parsed = transcripts.parse_upload("meeting-spoken.txt", text)
+        found = transcripts.extract_candidates(parsed["segments"])
+        by_pos = {(c["segment_key"], c["sentence_index"]): c for c in found}
+        expected = {
+            ("1", 1): ("決議", "D7", "那就這樣", "中", "", ""),
+            ("2", 1): ("決議", "D7", "就這樣定", "中", "", ""),
+            ("3", 1): ("決議", "D7", "就照這個做", "中", "", ""),
+            ("4", 1): ("決議", "D7", "我們就採用", "中", "", ""),
+            ("5", 1): ("決議", "D7", "確定用", "中", "", ""),
+            ("6", 1): ("決議", "D7", "OK那就", "中", "", ""),
+            ("7", 1): ("決議", "D7", "不用改了", "中", "", ""),
+            ("8", 1): ("決議", "D7", "先維持原案", "中", "", ""),
+            ("9", 1): ("待辦", "T4", "回去確認", "中", "林示範", "2026-11-20"),
+            ("10", 1): ("待辦", "T4", "回去確認", "中", "陳假設", ""),
+            ("11", 1): ("待辦", "T4", "要再提供", "中", "", ""),
+            ("12", 1): ("待辦", "T4", "下次會議前", "中", "", ""),
+            ("13", 1): ("待辦", "T4", "我們這邊會", "中", "", ""),
+            ("14", 1): ("待辦", "T4", "你們先", "中", "", ""),
+            ("15", 1): ("待辦", "T4", "再回覆", "中", "", ""),
+            ("16", 1): ("待辦", "T4", "補給我們", "中", "", ""),
+            ("17", 1): ("決議", "D1", "決議：", "高", "", ""),
+            ("18", 1): ("決議", "D7", "那就這樣", "中", "", ""),
+            ("44", 2): ("決議", "D7", "我們就採用", "中", "", ""),
+        }
+        self.assertEqual(set(by_pos), set(expected))
+        for key, spec in expected.items():
+            cand = by_pos[key]
+            self.assertEqual(
+                (cand["kind"], cand["rule_id"], cand["cue"], cand["confidence"], cand["owner"], cand["due_date"]),
+                spec,
+                key,
+            )
+            self.assertFalse(cand["source_quote"].startswith("["))
+            self.assertEqual(cand["extraction_method"], "rule:v3")
+            if cand["confidence"] != "高":
+                self.assertIn(cand["cue"], cand["reason"])
+        self.assertEqual(by_pos[("18", 1)]["source_quote"], "那就這樣。")
+        self.assertNotIn("要不要", by_pos[("18", 1)]["source_quote"])
+        adopted = by_pos[("44", 2)]
+        self.assertEqual(adopted["source_quote"], "我們就採用這個位置。")
+        self.assertTrue(adopted["context_refs"])
+        self.assertNotIn("比較麻煩", adopted["source_quote"])
+        v2 = transcripts.extract_candidates(parsed["segments"], method="rule:v2")
+        self.assertEqual([c["source_quote"] for c in v2], ["決議：本次採用合成備援盤。"])
+        blocked = "然後就是核准過的版本。"
+        self.assertNotIn(blocked, [c["source_quote"] for c in found])
+        still = transcripts.extract_candidates(
+            [{"source_segment_id": "1", "text": blocked, "location_label": "第 1 行"}],
+            extra_cues={"decisions": ["核准過的版本"], "todos": []},
+        )
+        self.assertEqual(still, [])
+
+    def test_local_cue_file_stays_off_the_terminal(self):
+        phrase = "虛構收口講法甲"
+        todo = "虛構補件講法甲"
+        cues = {"decisions": [phrase], "todos": [todo]}
+        bare = [{"source_segment_id": "1", "text": f"對，這段就用{phrase}處理。", "location_label": "第 1 行"}]
+        self.assertEqual(transcripts.extract_candidates(bare), [])
+        self.assertEqual(transcripts.extract_candidates(bare, method="rule:v2", extra_cues=cues), [])
+        hit = transcripts.extract_candidates(bare, extra_cues=cues)[0]
+        self.assertEqual((hit["rule_id"], hit["cue"], hit["confidence"], hit["owner"], hit["due_date"]),
+                         ("D8", phrase, "低", "", ""))
+        asked = [{"source_segment_id": "1", "text": f"{phrase}嗎？", "location_label": "第 1 行"}]
+        self.assertEqual(transcripts.extract_candidates(asked, extra_cues=cues), [])
+        assigned = [{"source_segment_id": "1", "text": f"請把{todo}補進清單。", "location_label": "第 1 行"}]
+        todo_hit = transcripts.extract_candidates(assigned, extra_cues=cues)[0]
+        self.assertEqual((todo_hit["kind"], todo_hit["rule_id"], todo_hit["confidence"]), ("待辦", "T5", "低"))
+        with self.assertRaises(transcripts.CueError):
+            transcripts.normalize_cues({"decisions": ["太短"]})
+        soft = transcripts.extract_candidates(
+            [{"source_segment_id": "1", "text": "ok那就維持虛構告警。", "location_label": "第 1 行"}])
+        self.assertEqual(soft[0]["cue"], "OK那就")
+
+        env = os.environ.copy()
+        env.pop("SDT_VERIFY_DIR", None)
+        env["PYTHONIOENCODING"] = "utf-8"
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            (folder / "fictional-cue.txt").write_text(f"對，這段就用{phrase}處理。\n", encoding="utf-8")
+            (folder / "cues.json").write_text(json.dumps(cues, ensure_ascii=False), encoding="utf-8")
+            proc = _run_verify(["--dir", str(folder)], env)
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, combined)
+            self.assertIn("candidates=1", proc.stdout)
+            self.assertIn("decisions=1", proc.stdout)
+            for hidden in (phrase, todo, "cues.json", "fictional-cue", str(folder)):
+                self.assertNotIn(hidden, combined)
+            report = (folder / "reports" / "verify-report.txt").read_text(encoding="utf-8")
+            self.assertIn(phrase, report)
+            self.assertIn("信心 低", report)
+            self.assertNotIn(todo, report)
+
+            (folder / "cues.json").write_text('{"decisions": ["' + phrase + '"', encoding="utf-8")
+            bad = _run_verify(["--dir", str(folder)], env)
+            bad_out = bad.stdout + bad.stderr
+            self.assertEqual(bad.returncode, 2)
+            self.assertIn("error=bad_cues", bad.stderr)
+            self.assertNotIn(phrase, bad_out)
+            self.assertNotIn(str(folder), bad_out)
+
+    def test_synthetic_precision_recall_is_not_real_accuracy(self):
+        text = (EXAMPLES / "meeting-spoken.txt").read_text(encoding="utf-8")
+        gold_text = (EXAMPLES / "annotation-spoken.json").read_text(encoding="utf-8")
+        self.assertIn("不是真實會議的準確率", gold_text)
+        env = os.environ.copy()
+        env.pop("SDT_VERIFY_DIR", None)
+        env["PYTHONIOENCODING"] = "utf-8"
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            (folder / "meeting-spoken.txt").write_text(text, encoding="utf-8")
+            (folder / "annotation.json").write_text(gold_text, encoding="utf-8")
+            result = verify(folder)
+            self.assertEqual(result["candidates"], 19)
+            self.assertEqual(result["gold"], 19)
+            self.assertEqual(result["scored"], 1)
+            self.assertEqual(result["refused"], 0)
+            self.assertEqual(result["score"]["by_kind"]["決議"]["precision"], "11/11")
+            self.assertEqual(result["score"]["by_kind"]["決議"]["recall"], "11/11")
+            self.assertEqual(result["score"]["by_kind"]["待辦"]["precision"], "8/8")
+            self.assertEqual(result["score"]["by_kind"]["待辦"]["recall"], "8/8")
+            self.assertIn("不是真實會議的準確率", result["text"])
+            proc = _run_verify(["--dir", str(folder)], env)
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, combined)
+            self.assertEqual(proc.stdout, "\n".join([
+                "status=0",
+                "files=1",
+                "segments=44",
+                "sentences=46",
+                "parse_warnings=0",
+                "candidates=19",
+                "decisions=11",
+                "todos=8",
+                "gold=19",
+                "pending=0",
+                "false_hits=0",
+                "scored=1",
+                "refused=0",
+                "",
+            ]))
+            for hidden in ("那就這樣", "核准過", "meeting-spoken", "準確率", str(folder)):
+                self.assertNotIn(hidden, combined)
+        proj = self.project()
+        imported = self.import_example("meeting-spoken.txt", proj["project_id"])
+        self.assertEqual(db.list_issues(self.conn), [])
+        self.assertTrue(all(d["review_status"] == "草稿" for d in imported["drafts"]))
+        sample = next(d for d in imported["drafts"] if d["cue"] == "那就這樣")
+        self.assertEqual(sample["confidence"], "中")
+        self.assertIn("請人工確認", sample["reason"])

@@ -496,7 +496,8 @@ async function previewReextract() {
     `先前抽取紀錄 ${res.runs.length} 筆。這是預覽，尚未寫入，也不會確認入帳。`,
   ];
   for (const row of res.added.slice(0, 12)) {
-    lines.push(`新增 ${row.kind} 規則 ${row.rule_id} 第 ${row.line || "—"} 行第 ${row.sentence_index} 句：${row.source_quote}`);
+    const cue = row.cue ? `　說法 ${row.cue}　信心 ${row.confidence || "—"}` : "";
+    lines.push(`新增 ${row.kind} 規則 ${row.rule_id}${cue} 第 ${row.line || "—"} 行第 ${row.sentence_index} 句：${row.source_quote}`);
   }
   const why = {
     legacy_quote: "舊草稿已依原文一對一對上",
@@ -602,6 +603,9 @@ function renderDraft(draft) {
   card.append(el("p", `抽取 ${draft.extraction_method || "—"}　句子位置 ${draft.sentence_index || "（舊資料未記錄）"}`, "hint"));
   if (draft.rule_id || draft.reason) {
     card.append(el("p", `規則 ${draft.rule_id || "—"}：${draft.reason || ""}`, "hint"));
+  }
+  if (draft.cue || draft.confidence) {
+    card.append(el("p", `對上的說法：${draft.cue || "—"}　信心：${draft.confidence || "—"}`, "hint"));
   }
   if (draft.review_gaps) card.append(el("p", `需人工核對：${draft.review_gaps}`, "hint"));
   const refs = Array.isArray(draft.context_refs) ? draft.context_refs : [];

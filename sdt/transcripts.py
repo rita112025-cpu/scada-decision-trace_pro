@@ -13,18 +13,20 @@ import re
 
 from . import db
 
-EXTRACTION_METHOD = "rule:v2"
+RULE_V2 = "rule:v2"
+RULE_V3 = "rule:v3"
+EXTRACTION_METHOD = RULE_V3
 LIMITATION = (
     "能力限制：此環境沒有可用的既有抽取器，也未呼叫外部 API 或下載模型。"
     "草稿只是可人工審核的候選，不是對會議的自動理解。"
-    "決議要有本次定案的標記（例如「決議：」「定案」「決定採用」「會議通過」「予以確認」「本次核准」）。"
-    "「核准」「決定」「確認」單獨出現不夠，歷史敘述（例如「核准過的版本」）也不當成這次的決議。"
-    "待辦要有「待辦」，或同一句裡的「請＋姓名＋動作」，或「請於／應於某日之前」。"
-    "已認得一部分否定、取消、提議與疑問句，沒列進去的講法仍可能誤收或漏掉。"
-    "同一句若同時像決議又像交辦，只產生一筆決議草稿。"
+    "目前抽取版本是 rule:v3。明文標記（決議：、定案、決定採用、待辦、請＋姓名＋動作）仍沿用 rule:v2，信心標為高。"
+    "另外收錄一部分台灣口語定案與交辦說法，信心標為中；本機說法清單對上的標為低。"
+    "問句、假設、建議、否定、取消，以及「核准過」「之前已經」這類過去的事，不列為候選。"
+    "「然後就是核准過的版本」這種歷史敘述不是這次的決議。很短的應聲（對、嗯、好、OK）也不列。"
     "負責人與期限只有這一句明文寫出才填，不依講者或前後文猜測。"
+    "同一句若同時像決議又像交辦，只產生一筆決議草稿。"
     "相鄰段落只作核對用，不會把多人的話拼成一句原話。"
-    "草稿必須經人工確認後才會寫進正式台帳。"
+    "草稿必須經人工確認後才會寫進正式台帳。沒有列進規則的講法仍可能漏掉，列進去的仍可能誤收。"
 )
 
 _JSON_KEYS = (
@@ -562,6 +564,215 @@ def _todo_rule(sentence):
     return None
 
 
+class CueError(Exception):
+    """本機說法清單格式不符。訊息不含清單內容。"""
+
+
+_V2_CUE = {
+    "D1": "決議：",
+    "D2": "定案",
+    "D3": "決定採用",
+    "D4": "會議通過",
+    "D5": "予以確認",
+    "D6": "本次核准",
+    "T1": "待辦",
+    "T2": "請＋姓名＋動作",
+    "T3": "請於／應於",
+}
+_DECISION_CUES = (
+    "那就這樣",
+    "就這樣定",
+    "就照這個做",
+    "我們就採用",
+    "確定用",
+    "不用改了",
+    "先維持原案",
+    "OK那就",
+)
+_TODO_CUES = (
+    "回去確認",
+    "要再提供",
+    "下次會議前",
+    "我們這邊會",
+    "你們先",
+    "再回覆",
+    "補給我們",
+    "麻煩",
+)
+_LEAD = re.compile(
+    r"^(?:(?:對+|嗯+|喔+|哦+|啊+|恩+|好+|OK|ok)[，,\s]+|(?:就是|然後)[，,\s]+)"
+)
+_V3_GUARD = re.compile(
+    r"嗎|呢|[？?]|要不要|是不是|會不會|有沒有|能不能|能否|是否|對不對|好不好|"
+    r"如果|若是|假如|要是|可能|應該|建議|要不然|不然就|不然的話|考慮|或許|也許|好像|似乎|"
+    r"不是|不要|先別|別再|沒有要|不用再|不要再|不再|先不要|先不|並沒有|沒要|"
+    r"未核准|沒有核准|不採用|不通過|不同意|否決|不確定|"
+    r"待辦已取消|已取消|沒有待辦|不是待辦|不麻煩|不必|無需|請勿|暫不|尚未|還沒|"
+    r"核准過|已核准|已經核准|先前核准|之前核准|上次|之前已經|以前已經|先前已經|"
+    r"之前就|以前就|先前就|早就|已經決定過|決定過了|曾經核准|過了"
+)
+_COLLOQUIAL_OWNER = (
+    re.compile(rf"麻煩(?P<name>{_NAME})(?=回去|再|先|幫|確認|提供|補|看|處理|整理|追蹤|於)"),
+    re.compile(rf"請(?P<name>{_NAME})(?=回去|再|先|幫)"),
+)
+
+
+def _core_len(sentence):
+    text = (sentence or "").strip()
+    previous = None
+    while text and text != previous:
+        previous = text
+        text = _LEAD.sub("", text).strip()
+    core = re.sub(r"[\s，,。！？!?、…\.：:]+", "", text)
+    return len(core)
+
+
+def _colloquial_blocked(sentence):
+    if _core_len(sentence) < 4:
+        return True
+    return _V3_GUARD.search(sentence) is not None
+
+
+def _decision_cue(sentence):
+    for cue in _DECISION_CUES:
+        if cue == "OK那就":
+            if re.search(r"(?i)ok那就", sentence):
+                return cue
+            continue
+        if cue == "確定用" and "確定用戶" in sentence:
+            continue
+        if cue in sentence:
+            return cue
+    return ""
+
+
+def _todo_cue(sentence):
+    for cue in _TODO_CUES:
+        if cue == "麻煩":
+            if re.search(r"(?:比較|很|太|有點|真|稍|不)麻煩", sentence):
+                continue
+            if re.search(r"麻煩.{2,}", sentence):
+                return cue
+            continue
+        if cue == "我們這邊會" and "會不會" in sentence:
+            continue
+        if cue in sentence:
+            return cue
+    return ""
+
+
+def _local_cue(sentence, phrases):
+    for phrase in phrases or []:
+        if phrase and phrase in sentence:
+            return phrase
+    return ""
+
+
+def normalize_cues(data):
+    """整理本機說法清單。只收字面說法，不執行正規表示式。格式不符時不带回清單內容。"""
+    if not isinstance(data, dict):
+        raise CueError()
+    out = {"decisions": [], "todos": []}
+    for key in ("decisions", "todos"):
+        rows = data.get(key, [])
+        if rows is None:
+            rows = []
+        if not isinstance(rows, list) or len(rows) > 40:
+            raise CueError()
+        seen = set()
+        for row in rows:
+            if not isinstance(row, str):
+                raise CueError()
+            phrase = row.strip()
+            if len(phrase) < 4 or len(phrase) > 40 or any(ord(ch) < 32 for ch in phrase):
+                raise CueError()
+            if phrase in seen:
+                continue
+            seen.add(phrase)
+            out[key].append(phrase)
+    return out
+
+
+def extract_owner_explicit(sentence):
+    """姓名只取自這一句的明文。不看講者。"""
+    name = extract_owner(sentence)
+    if name:
+        return name
+    for cre in _COLLOQUIAL_OWNER:
+        matched = cre.search(sentence or "")
+        if not matched:
+            continue
+        found = matched.group("name")
+        if any(part in found for part in _NAME_BAD_PARTS):
+            continue
+        if found not in sentence:
+            continue
+        return found
+    return ""
+
+
+def _explicit_hit(kind, rule_id, reason, also_todo):
+    return {
+        "kind": kind,
+        "rule_id": rule_id,
+        "reason": reason,
+        "cue": _V2_CUE[rule_id],
+        "confidence": "高",
+        "also_todo": also_todo,
+    }
+
+
+def _spoken_hit(kind, rule_id, cue, confidence, source, also_todo):
+    where = "內建口語" if source == "builtin" else "本機說法清單"
+    if kind == "決議":
+        reason = f"{where}對上「{cue}」。信心：{confidence}。這不是明文的決議標記，請人工確認是不是這次定案。"
+    else:
+        reason = (
+            f"{where}對上「{cue}」。信心：{confidence}。"
+            "請人工確認是不是明確交辦。這一句沒寫的負責人與期限留空。"
+        )
+    return {
+        "kind": kind,
+        "rule_id": rule_id,
+        "reason": reason,
+        "cue": cue,
+        "confidence": confidence,
+        "also_todo": also_todo,
+    }
+
+
+def _classify_candidate(sentence, method, extra_cues):
+    """rule:v2 只看明文標記。rule:v3 在同一套標記之後才收口語，並先套防護。"""
+    decision = _decision_rule(sentence)
+    todo = _todo_rule(sentence)
+    if decision:
+        rule_id, reason = decision
+        return _explicit_hit("決議", rule_id, reason, bool(todo))
+    if method == RULE_V2:
+        if not todo:
+            return None
+        rule_id, reason = todo
+        return _explicit_hit("待辦", rule_id, reason, False)
+    if todo:
+        rule_id, reason = todo
+        return _explicit_hit("待辦", rule_id, reason, False)
+    if _colloquial_blocked(sentence):
+        return None
+    cue = _decision_cue(sentence)
+    todo_cue = _todo_cue(sentence)
+    local_decision = _local_cue(sentence, (extra_cues or {}).get("decisions"))
+    local_todo = _local_cue(sentence, (extra_cues or {}).get("todos"))
+    if cue:
+        return _spoken_hit("決議", "D7", cue, "中", "builtin", bool(todo_cue or local_todo))
+    if local_decision:
+        return _spoken_hit("決議", "D8", local_decision, "低", "local", bool(todo_cue or local_todo))
+    if todo_cue:
+        return _spoken_hit("待辦", "T4", todo_cue, "中", "builtin", False)
+    if local_todo:
+        return _spoken_hit("待辦", "T5", local_todo, "低", "local", False)
+    return None
+
+
 def _review_gaps(kind, owner, due, context_used, also_todo):
     gaps = []
     if not owner:
@@ -590,34 +801,35 @@ def _context_ref(seg):
     }
 
 
-def extract_candidates(segments):
+def extract_candidates(segments, method=None, extra_cues=None):
     """由段落產生候選草稿。同一句最多一筆；不會把草稿寫進正式台帳。
 
     前後段只在本句已有候選、且出現指代時附上，用來給人核對。不用前後段多收草稿，
-    也不把多段原文接成一句。
+    也不把多段原文接成一句。method 可指定 rule:v2，用來重現舊版明文規則；
+    省略時用 rule:v3。extra_cues 只在 v3 生效，問句與歷史敘述仍然先被擋下。
     """
+    method = method or EXTRACTION_METHOD
+    if method not in {RULE_V2, RULE_V3}:
+        raise db.ValidationError([f"未知的抽取版本 {method}"])
+    cues = extra_cues if method == RULE_V3 else None
     ordered = list(segments)
     found = []
     seen = set()
     for index, seg in enumerate(ordered):
         source_id = str(seg.get("source_segment_id") or f"#{index}")
         for sentence_index, sentence in enumerate(_sentences(seg.get("text") or ""), start=1):
-            decision = _decision_rule(sentence)
-            todo = _todo_rule(sentence)
-            if decision:
-                kind = "決議"
-                rule_id, reason = decision
-            elif todo:
-                kind = "待辦"
-                rule_id, reason = todo
-            else:
+            hit = _classify_candidate(sentence, method, cues)
+            if not hit:
                 continue
             # 同一來源位置只留一筆（決議優先）。相同句子出現在別的段落要各自保留。
             key = (source_id, sentence_index)
             if key in seen:
                 continue
             seen.add(key)
-            owner = extract_owner(sentence)
+            if method == RULE_V2:
+                owner = extract_owner(sentence)
+            else:
+                owner = extract_owner_explicit(sentence)
             due = extract_due(sentence)
             context = []
             if _ANAPHORA.search(sentence) and index > 0:
@@ -626,7 +838,7 @@ def extract_candidates(segments):
                 "segment_key": source_id,
                 "segment_id": seg.get("segment_id") or "",
                 "sentence_index": sentence_index,
-                "kind": kind,
+                "kind": hit["kind"],
                 "summary": sentence,
                 "source_quote": sentence,
                 "location_label": seg.get("location_label") or "",
@@ -635,11 +847,14 @@ def extract_candidates(segments):
                 "owner_origin": "原文" if owner else "未指定",
                 "due_date": due,
                 "due_origin": "原文" if due else "未指定",
-                "extraction_method": EXTRACTION_METHOD,
+                "extraction_method": method,
                 "limitation": LIMITATION,
-                "rule_id": rule_id,
-                "reason": reason,
-                "review_gaps": _review_gaps(kind, owner, due, bool(context), bool(decision and todo)),
+                "rule_id": hit["rule_id"],
+                "reason": hit["reason"],
+                "cue": hit["cue"],
+                "confidence": hit["confidence"],
+                "review_gaps": _review_gaps(
+                    hit["kind"], owner, due, bool(context), hit["also_todo"]),
                 "context_refs": context,
             })
     return found
@@ -673,15 +888,16 @@ def _insert_draft(conn, *, project_id, transcript_id, segment_id, cand, when):
             draft_id, project_id, transcript_id, segment_id, kind, summary, source_quote,
             location_label, timestamp_label, extraction_method, limitation, owner, owner_origin,
             due_date, due_origin, review_status, issue_id, rule_id, reason, review_gaps,
-            context_refs, sentence_index, created_at, updated_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            context_refs, sentence_index, cue, confidence, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (did, project_id, transcript_id, segment_id, cand["kind"], cand["summary"],
          cand["source_quote"], cand["location_label"], cand["timestamp_label"],
          cand["extraction_method"], cand["limitation"], cand["owner"], cand["owner_origin"],
          cand["due_date"], cand["due_origin"], "草稿", "", cand.get("rule_id") or "",
          cand.get("reason") or "", cand.get("review_gaps") or "",
          json.dumps(cand.get("context_refs") or [], ensure_ascii=False),
-         str(cand.get("sentence_index") or ""), when, when))
+         str(cand.get("sentence_index") or ""), cand.get("cue") or "", cand.get("confidence") or "",
+         when, when))
     return get_draft(conn, did)
 
 
@@ -874,6 +1090,7 @@ def confirm_draft(conn, draft_id, operator, *, now=None):
         raise db.ValidationError([f"未知的草稿類型 {kind}"])
     description = (
         f"【{kind}】由逐字稿草稿確認入帳。抽取方式：{draft['extraction_method']}。\n"
+        f"對上的說法：{draft.get('cue') or '（無）'}。信心：{draft.get('confidence') or '（無）'}。\n"
         "規則抽取，不是模型。沒有被收成草稿的句子不代表已經判斷正確；"
         "負責人與期限留空表示這一句沒有明文。\n\n"
         f"{draft['summary']}"
@@ -1270,6 +1487,8 @@ def _reextract_plan(conn, transcript_id):
             "sentence_index": sentence_index,
             "kind": cand["kind"],
             "rule_id": cand["rule_id"],
+            "cue": cand.get("cue") or "",
+            "confidence": cand.get("confidence") or "",
             "line": (seg or {}).get("line_start") or "",
             "source_quote": cand["source_quote"],
         }
@@ -1311,6 +1530,8 @@ def _public_extract_row(row):
         "sentence_index": row.get("sentence_index") or "",
         "kind": row.get("kind") or "",
         "rule_id": row.get("rule_id") or "",
+        "cue": row.get("cue") or "",
+        "confidence": row.get("confidence") or "",
         "line": row.get("line") or "",
         "source_quote": row.get("source_quote") or "",
         "draft_id": row.get("draft_id") or "",

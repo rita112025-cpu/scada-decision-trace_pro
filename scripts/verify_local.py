@@ -136,9 +136,26 @@ def load_table(path):
     return _as_items(rows)
 
 
-def candidate_rows(parsed, filename):
+def load_cues(directory):
+    """讀驗收目錄裡的 cues.json。沒有檔案就只用內建規則。內容不回傳到終端。"""
+    path = pathlib.Path(directory) / "cues.json"
+    if not path.is_file():
+        return {"decisions": [], "todos": []}
+    try:
+        data = json.loads(read_only_text(path))
+    except VerifyProblem:
+        raise
+    except Exception:
+        raise VerifyProblem("bad_cues")
+    try:
+        return transcripts.normalize_cues(data)
+    except transcripts.CueError:
+        raise VerifyProblem("bad_cues")
+
+
+def candidate_rows(parsed, filename, extra_cues=None):
     rows = []
-    for cand in transcripts.extract_candidates(parsed["segments"]):
+    for cand in transcripts.extract_candidates(parsed["segments"], extra_cues=extra_cues):
         seg = next(s for s in parsed["segments"] if s["source_segment_id"] == cand["segment_key"])
         rows.append({
             "kind": cand["kind"],
@@ -147,6 +164,8 @@ def candidate_rows(parsed, filename):
             "sentence": str(cand["sentence_index"]),
             "segment_id": seg["source_segment_id"],
             "rule_id": cand["rule_id"],
+            "cue": cand.get("cue") or "",
+            "confidence": cand.get("confidence") or "",
             "quote": cand["source_quote"],
             "owner": cand["owner"],
             "due_date": cand["due_date"],
@@ -258,7 +277,7 @@ def evaluate_score(gold, predicted, locations):
     }
 
 
-def analyze_file(path):
+def analyze_file(path, extra_cues=None):
     text = read_only_text(path).replace("\r\n", "\n").replace("\r", "\n")
     try:
         parsed = transcripts.parse_upload(path.name, text)
@@ -277,7 +296,7 @@ def analyze_file(path):
         "filename": path.name,
         "time_counts": counts,
         "timestamp_status": parsed.get("timestamp_status", ""),
-        "candidates": candidate_rows(parsed, path.name),
+        "candidates": candidate_rows(parsed, path.name, extra_cues),
         "lines": line_map(parsed),
         "segments": len(segments),
         "sentences": sentences,
@@ -285,7 +304,7 @@ def analyze_file(path):
     }
 
 
-def build_report(directory, analyses, gold, pending, false_hits, docx_present, score):
+def build_report(directory, analyses, gold, pending, false_hits, docx_present, score, cue_counts=None):
     lines = [
         "本機驗收報告",
         f"目錄：{directory}",
@@ -302,6 +321,15 @@ def build_report(directory, analyses, gold, pending, false_hits, docx_present, s
     else:
         lines.append(f"目錄裡沒有 {DOCX_NAME}。沒有參考文件可對照；這不影響逐字稿候選統計。")
     lines.append("")
+    counts = cue_counts or {"decisions": 0, "todos": 0}
+    cue_total = counts.get("decisions", 0) + counts.get("todos", 0)
+    if cue_total:
+        lines.append(
+            f"已讀取本機說法清單：決議 {counts.get('decisions', 0)} 條、待辦 {counts.get('todos', 0)} 條。"
+            "清單原文不轉載；只有這次對上的候選會寫出說法名稱。"
+        )
+    else:
+        lines.append("沒有本機說法清單（cues.json）。只用內建規則。")
     lines.append("評估樣本範圍：目錄第一層的 UTF-8 .txt。子目錄與其他副檔名不納入。")
     if not analyses:
         lines.append("沒有找到 TXT。")
@@ -322,6 +350,7 @@ def build_report(directory, analyses, gold, pending, false_hits, docx_present, s
             predicted.append(cand)
             lines.append(
                 f"  候選 {cand['kind']} 規則 {cand['rule_id']} "
+                f"說法 {cand.get('cue') or '—'} 信心 {cand.get('confidence') or '—'} "
                 f"第 {cand['line']} 行第 {cand['sentence']} 句：{cand['quote']}"
             )
     lines.append("")
@@ -372,6 +401,7 @@ def build_report(directory, analyses, gold, pending, false_hits, docx_present, s
                 f" recall {scored['recall']}（分子是與候選一對一對上的標註數，分母是該類已能唯一定位的標註數）。"
             )
         lines.append("對不到逐字稿的參考項目若放在 pending.json，沒有算進分母。")
+        lines.append("這個分數只描述本次目錄裡的標註與候選。若標註是虛構句子，它不是真實會議的準確率。")
     lines.append("")
     lines.append("未驗證：本腳本沒有打開瀏覽器、沒有讀取參考 docx 內文、沒有把候選寫進事項台帳。")
     return "\n".join(lines) + "\n", predicted
@@ -381,6 +411,7 @@ def verify(directory):
     directory = pathlib.Path(directory)
     if not directory.is_dir():
         raise VerifyProblem("missing_dir")
+    cues = load_cues(directory)
     analyses = []
     try:
         names = sorted(directory.glob("*.txt"))
@@ -389,7 +420,7 @@ def verify(directory):
     for path in names:
         if not path.is_file():
             continue
-        analyses.append(analyze_file(path))
+        analyses.append(analyze_file(path, cues))
     gold = load_table(directory / "annotation.json")
     if not gold and (directory / "annotation.csv").is_file():
         gold = load_table(directory / "annotation.csv")
@@ -399,7 +430,10 @@ def verify(directory):
     locations = {item["filename"]: item["lines"] for item in analyses}
     predicted = [cand for item in analyses for cand in item["candidates"]]
     score = evaluate_score(gold, predicted, locations)
-    report, _ = build_report(directory, analyses, gold, pending, false_hits, docx_present, score)
+    report, _ = build_report(
+        directory, analyses, gold, pending, false_hits, docx_present, score,
+        {"decisions": len(cues["decisions"]), "todos": len(cues["todos"])},
+    )
     try:
         out_dir = directory / "reports"
         out_dir.mkdir(exist_ok=True)
