@@ -492,15 +492,23 @@ async function previewReextract() {
   const lines = [
     res.message,
     `抽取版本：${res.extraction_method}`,
-    `將新增 ${res.added_count}、來源位置已存在而略過 ${res.skipped_count}、既有草稿保留 ${res.kept_count}`,
+    `將新增 ${res.added_count}、來源位置已存在而略過 ${res.skipped_count}、既有草稿保留 ${res.kept_count}、待核對 ${res.pending_count || 0}`,
     `先前抽取紀錄 ${res.runs.length} 筆。這是預覽，尚未寫入，也不會確認入帳。`,
   ];
   for (const row of res.added.slice(0, 12)) {
     lines.push(`新增 ${row.kind} 規則 ${row.rule_id} 第 ${row.line || "—"} 行第 ${row.sentence_index} 句：${row.source_quote}`);
   }
+  const why = {
+    legacy_quote: "舊草稿已依原文一對一對上",
+    legacy_position: "舊草稿已依來源位置對上，原句保留",
+    ambiguous: "無法唯一定位，標為待核對，沒有新增",
+    position: "來源位置已有草稿",
+  };
   for (const row of res.skipped.slice(0, 8)) {
-    const why = row.reason === "legacy_quote" ? "舊草稿已依原文一對一對上" : "來源位置已有草稿";
-    lines.push(`略過 ${row.kind} 第 ${row.line || "—"} 行第 ${row.sentence_index} 句（${why}）`);
+    lines.push(`略過 ${row.kind} 第 ${row.line || "—"} 行第 ${row.sentence_index} 句（${why[row.reason] || "來源位置已有草稿"}）`);
+  }
+  for (const row of (res.pending_review || []).slice(0, 8)) {
+    lines.push(`待核對 ${row.draft_id}：${row.note || "無法對到唯一的來源位置，沒有新增草稿"}`);
   }
   const pre = $("#reextract-preview");
   pre.textContent = lines.join("\n");

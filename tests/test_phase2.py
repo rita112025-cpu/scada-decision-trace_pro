@@ -523,6 +523,111 @@ class TestReextract(Base):
         self.assertTrue(all(d["sentence_index"] == "" for d in stored))
         self.assertEqual(len(stored), len(imported["drafts"]))
 
+    def test_legacy_timestamp_prefix_maps_by_position_after_reparse(self):
+        proj = self.project()
+        text = "\n".join([
+            "[00:00:01.00–00:00:02.00] 決議：採用虛構甲案。",
+            "[00:00:03-00:00:04] 待辦：更新虛構盤面。",
+            "[00:00:05.5–00:00:06] 決議：採用虛構乙案。待辦：請林示範於 2026-12-01 前補上端子對照。",
+            "[00:00:09.00–00:00:10.00] 就照這樣定案。就照這樣定案。",
+        ]) + "\n"
+        imported = transcripts.import_transcript(
+            self.conn, project_id=proj["project_id"], filename="fictional-legacy.txt",
+            content_base64=b64(text), operator="測試員")
+        tid = imported["transcript_id"]
+        drafts = list(imported["drafts"])
+        confirmed_src = next(d for d in drafts if d["source_quote"] == "決議：採用虛構甲案。")
+        discarded_src = next(d for d in drafts if d["source_quote"] == "待辦：更新虛構盤面。")
+        confirmed = transcripts.confirm_draft(self.conn, confirmed_src["draft_id"], "測試員")
+        transcripts.discard_draft(self.conn, discarded_src["draft_id"])
+        issue_id = confirmed["issue"]["issue_id"]
+        segments = transcripts.list_segments(self.conn, tid)
+
+        def prefixed(draft):
+            raw = next(s["raw_text"] for s in segments if s["segment_id"] == draft["segment_id"])
+            return raw.split("]", 1)[0] + "] " + draft["source_quote"]
+
+        ambiguous = [d for d in drafts if d["source_quote"] == "就照這樣定案。"]
+        self.assertEqual(len(ambiguous), 2)
+        self.conn.execute("DELETE FROM drafts WHERE draft_id=?", (ambiguous[1]["draft_id"],))
+        kept = [d for d in drafts if d["draft_id"] != ambiguous[1]["draft_id"]]
+        quotes = {}
+        for draft in kept:
+            quote = prefixed(draft)
+            quotes[draft["draft_id"]] = quote
+            self.conn.execute(
+                """UPDATE drafts
+                   SET source_quote=?, summary=?, sentence_index='', extraction_method='rule:v1'
+                   WHERE draft_id=?""",
+                (quote, "舊摘要：" + quote, draft["draft_id"]))
+        self.conn.execute(
+            "UPDATE issues SET source_quote=? WHERE issue_id=?",
+            (quotes[confirmed_src["draft_id"]], issue_id))
+        self.conn.execute("UPDATE transcript_segments SET text=raw_text WHERE transcript_id=?", (tid,))
+        self.conn.commit()
+        reparsed = transcripts.reparse_apply(self.conn, tid)
+        self.assertTrue(reparsed["applied"])
+        after_parse = {s["line_start"]: s for s in transcripts.list_segments(self.conn, tid)}
+        self.assertEqual(after_parse[1]["text"], "決議：採用虛構甲案。")
+        self.assertTrue(after_parse[1]["raw_text"].startswith("[00:00:01.00–00:00:02.00]"))
+        self.assertEqual(after_parse[2]["text"], "待辦：更新虛構盤面。")
+        self.assertTrue(after_parse[2]["raw_text"].startswith("[00:00:03-00:00:04]"))
+        self.assertEqual(
+            after_parse[3]["text"],
+            "決議：採用虛構乙案。待辦：請林示範於 2026-12-01 前補上端子對照。")
+        self.assertEqual(after_parse[4]["text"], "就照這樣定案。就照這樣定案。")
+        self.assertEqual(len(transcripts.list_drafts(
+            self.conn, project_id=proj["project_id"], transcript_id=tid)), 5)
+
+        preview = transcripts.reextract_preview(self.conn, tid)
+        self.assertFalse(preview["applied"])
+        self.assertEqual(preview["added_count"], 0)
+        self.assertEqual(preview["pending_count"], 1)
+        self.assertEqual(preview["pending_review"][0]["draft_id"], ambiguous[0]["draft_id"])
+        self.assertEqual(preview["pending_review"][0]["review"], "待核對")
+        self.assertEqual(preview["pending_review"][0]["source_quote"], quotes[ambiguous[0]["draft_id"]])
+        self.assertIn("待核對", preview["message"])
+        self.assertEqual(len(transcripts.list_drafts(
+            self.conn, project_id=proj["project_id"], transcript_id=tid)), 5)
+        positioned = [row for row in preview["skipped"] if row["reason"] == "legacy_position"]
+        self.assertEqual(
+            {row["draft_id"] for row in positioned},
+            {confirmed_src["draft_id"], discarded_src["draft_id"]} | {
+                d["draft_id"] for d in kept
+                if d["draft_id"] not in {confirmed_src["draft_id"], discarded_src["draft_id"], ambiguous[0]["draft_id"]}
+            },
+        )
+        self.assertTrue(any(row["reason"] == "ambiguous" for row in preview["skipped"]))
+
+        applied = transcripts.reextract_apply(self.conn, tid)
+        self.assertEqual(applied["added_count"], 0)
+        self.assertEqual(applied["added_draft_ids"], [])
+        self.assertEqual(applied["pending_count"], 1)
+        self.assertEqual(applied["pending_review"][0]["review"], "待核對")
+        self.assertIn("沒有確認入帳", applied["message"])
+        stored = transcripts.list_drafts(self.conn, project_id=proj["project_id"], transcript_id=tid)
+        self.assertEqual(len(stored), 5)
+        by_id = {d["draft_id"]: d for d in stored}
+        self.assertEqual(by_id[confirmed_src["draft_id"]]["review_status"], "已確認")
+        self.assertEqual(by_id[confirmed_src["draft_id"]]["source_quote"], quotes[confirmed_src["draft_id"]])
+        self.assertEqual(by_id[confirmed_src["draft_id"]]["summary"], "舊摘要：" + quotes[confirmed_src["draft_id"]])
+        self.assertEqual(by_id[confirmed_src["draft_id"]]["extraction_method"], "rule:v1")
+        self.assertEqual(by_id[discarded_src["draft_id"]]["review_status"], "已捨棄")
+        self.assertTrue(by_id[discarded_src["draft_id"]]["source_quote"].startswith("[00:00:03-00:00:04] "))
+        self.assertEqual(db.get_issue(self.conn, issue_id)["source_quote"], quotes[confirmed_src["draft_id"]])
+        self.assertEqual(len(db.list_issues(self.conn)), 1)
+        self.assertTrue(all(d["sentence_index"] == "" and d["extraction_method"] == "rule:v1" for d in stored))
+
+        second = transcripts.reextract_apply(self.conn, tid)
+        self.assertEqual(second["added_count"], 0)
+        self.assertEqual(second["pending_count"], 1)
+        stored_again = transcripts.list_drafts(self.conn, project_id=proj["project_id"], transcript_id=tid)
+        self.assertEqual(
+            [(d["draft_id"], d["source_quote"], d["review_status"], d["summary"]) for d in stored_again],
+            [(d["draft_id"], d["source_quote"], d["review_status"], d["summary"]) for d in stored],
+        )
+        self.assertEqual(len(db.list_issues(self.conn)), 1)
+
     def test_http_reextract_preview_does_not_apply_without_confirm(self):
         http_dir = self.dir / "http"
         http_dir.mkdir()

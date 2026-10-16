@@ -1096,11 +1096,145 @@ def _list_extraction_runs(conn, transcript_id):
     return [dict(r) for r in rows]
 
 
+def _legacy_body(quote):
+    """舊版原文可能把時間標記留在句首。認得出來就拿掉，只用於對位置，不改已存原文。"""
+    text = (quote or "").strip()
+    matched = _STAMP.match(text)
+    if not matched:
+        return text, False
+    return matched.group("rest").strip(), True
+
+
+def _stamp_ms_pair(matched):
+    start = _clock_ms(int(matched["sh"]), int(matched["sm"]), int(matched["ss"]), matched["sf"])
+    if matched["eh"] is None:
+        return start, None
+    end = _clock_ms(int(matched["eh"]), int(matched["em"]), int(matched["es"]), matched["ef"])
+    return start, end
+
+
+def _segment_matches_quote_stamp(quote, seg):
+    quoted = _STAMP.match((quote or "").strip())
+    if not quoted:
+        return False
+    want = _stamp_ms_pair(quoted)
+    raw = _STAMP.match((seg.get("raw_text") or "").strip())
+    if raw and _stamp_ms_pair(raw) == want:
+        return True
+
+    def as_ms(value):
+        if value in ("", None):
+            return None
+        return int(round(float(value) * 1000))
+
+    have = (as_ms(seg.get("start_seconds")), as_ms(seg.get("end_seconds")))
+    if want[1] is None:
+        return have[0] == want[0] and have[1] is None
+    return have == want
+
+
+def _sentence_indexes(segment, body):
+    return [
+        str(index)
+        for index, sentence in enumerate(_sentences(segment.get("text") or ""), start=1)
+        if sentence == body
+    ]
+
+
+def _pending_legacy(draft, segment):
+    return {
+        "draft_id": draft["draft_id"],
+        "segment_id": draft.get("segment_id") or "",
+        "line": (segment or {}).get("line_start") or "",
+        "review": "待核對",
+        "reason": "ambiguous",
+        "source_quote": draft.get("source_quote") or "",
+        "note": "這筆舊原文無法對到唯一的來源位置。原句與審核狀態保留，沒有把它當成新位置，也沒有新增草稿。",
+    }
+
+
+def _map_legacy_drafts(drafts, prepared, occupied=()):
+    """沒有句序的舊草稿依來源位置對上。時間前綴只用來定位，不回寫原文。
+
+    對到唯一的（檔案內段落、行、句序）就佔住該位置。對不到或對到多處則列為待核對，
+    那些位置不新增草稿。
+    """
+    by_id = {seg["segment_id"]: seg for seg in prepared if seg.get("segment_id")}
+    occupied = set(occupied)
+    mapped = {}
+    stripped = set()
+    pending = []
+    suppress = set()
+    seen_pending = set()
+
+    def flag(draft, positions):
+        if draft["draft_id"] not in seen_pending:
+            seen_pending.add(draft["draft_id"])
+            pending.append(_pending_legacy(draft, by_id.get(draft.get("segment_id"))))
+        for pos in positions:
+            suppress.add(pos)
+
+    for draft in drafts:
+        if str(draft.get("sentence_index") or ""):
+            continue
+        body, had_stamp = _legacy_body(draft["source_quote"])
+        if had_stamp:
+            stripped.add(draft["draft_id"])
+        own = by_id.get(draft.get("segment_id"))
+        parts = _sentences(body)
+        if len(parts) != 1:
+            hits = []
+            if own and body and body == (own.get("text") or "").strip():
+                count = len(_sentences(own.get("text") or ""))
+                hits = [(own["segment_id"], str(index)) for index in range(1, count + 1)]
+            flag(draft, hits)
+            continue
+        if own:
+            indexes = _sentence_indexes(own, body)
+            if len(indexes) == 1:
+                pos = (own["segment_id"], indexes[0])
+                if pos in occupied:
+                    flag(draft, [pos])
+                    continue
+                if pos in mapped:
+                    flag(draft, [pos])
+                    flag(mapped[pos], [pos])
+                    mapped.pop(pos, None)
+                else:
+                    mapped[pos] = draft
+                continue
+            if len(indexes) > 1:
+                flag(draft, [(own["segment_id"], index) for index in indexes])
+                continue
+        hits = []
+        for seg in prepared:
+            for index in _sentence_indexes(seg, body):
+                hits.append((seg["segment_id"], index, seg))
+        if had_stamp:
+            stamped = [hit for hit in hits if _segment_matches_quote_stamp(draft["source_quote"], hit[2])]
+            if stamped:
+                hits = stamped
+        if len(hits) == 1:
+            pos = (hits[0][0], hits[0][1])
+            if pos in occupied:
+                flag(draft, [pos])
+                continue
+            if pos in mapped:
+                flag(draft, [pos])
+                flag(mapped[pos], [pos])
+                mapped.pop(pos, None)
+            else:
+                mapped[pos] = draft
+        else:
+            flag(draft, [(hit[0], hit[1]) for hit in hits])
+    return mapped, stripped, pending, suppress
+
+
 def _reextract_plan(conn, transcript_id):
     """比對目前規則與既有草稿。不寫入。
 
-    已有句子位置的草稿佔住 (段落, 句序)。沒有句子位置的舊草稿改以段落加原文一對一配對，
-    不回填、不覆寫。對不上的新位置才會列為可新增。
+    已有句子位置的草稿佔住 (段落, 句序)。沒有句子位置的舊草稿先辨識句首時間標記，
+    再依段落與句序一對一佔位；原句不回寫。無法唯一定位的舊草稿列為待核對，不新增草稿。
     """
     item = get_transcript(conn, transcript_id)
     stored = list_segments(conn, transcript_id)
@@ -1111,17 +1245,15 @@ def _reextract_plan(conn, transcript_id):
     issues = [dict(r) for r in conn.execute(
         "SELECT issue_id, source_quote FROM issues WHERE transcript_id=?", (transcript_id,))]
     positioned = {}
-    legacy = {}
     for draft in drafts:
         index = str(draft.get("sentence_index") or "")
         if index:
             positioned[(draft["segment_id"], index)] = draft
-        else:
-            legacy.setdefault((draft["segment_id"], draft["source_quote"]), []).append(draft)
     by_id = {seg["segment_id"]: seg for seg in prepared if seg.get("segment_id")}
+    mapped, stripped, pending, suppress = _map_legacy_drafts(drafts, prepared, positioned)
     added = []
     skipped = []
-    claimed = set(positioned)
+    claimed = set(positioned) | set(mapped)
     for cand in candidates:
         seg = by_id.get(cand.get("segment_id") or "")
         if seg is None:
@@ -1141,15 +1273,18 @@ def _reextract_plan(conn, transcript_id):
         pos = (seg["segment_id"], sentence_index)
         base["segment_id"] = seg["segment_id"]
         if pos in claimed:
-            holder = positioned.get(pos)
+            holder = positioned.get(pos) or mapped.get(pos)
+            if pos in positioned:
+                reason = "position"
+            elif holder and holder["draft_id"] in stripped:
+                reason = "legacy_position"
+            else:
+                reason = "legacy_quote"
             skipped.append(dict(
-                base, draft_id=holder["draft_id"] if holder else "", reason="position"))
+                base, draft_id=holder["draft_id"] if holder else "", reason=reason))
             continue
-        bucket = legacy.get((seg["segment_id"], cand["source_quote"])) or []
-        if bucket:
-            holder = bucket.pop(0)
-            claimed.add(pos)
-            skipped.append(dict(base, draft_id=holder["draft_id"], reason="legacy_quote"))
+        if pos in suppress:
+            skipped.append(dict(base, draft_id="", reason="ambiguous"))
             continue
         added.append(dict(base, candidate=cand))
         claimed.add(pos)
@@ -1160,6 +1295,7 @@ def _reextract_plan(conn, transcript_id):
         "issues": issues,
         "added": added,
         "skipped": skipped,
+        "pending_review": pending,
     }
 
 
@@ -1198,12 +1334,9 @@ def reextract_preview(conn, transcript_id):
         ],
         "issue_ids": [i["issue_id"] for i in plan["issues"]],
         "runs": _list_extraction_runs(conn, transcript_id),
-        "message": (
-            "這是重新抽取的預覽，尚未寫入，也不會確認入帳。"
-            "只會列出來源位置還沒有草稿的候選。"
-            "既有摘要、原文、審核狀態與已入帳事項都不會被覆寫。"
-            "時間重新解析是另一個動作。"
-        ),
+        "pending_review": plan["pending_review"],
+        "pending_count": len(plan["pending_review"]),
+        "message": _reextract_message(plan, applied=False),
     }
 
 
@@ -1284,6 +1417,10 @@ def reextract_apply(conn, transcript_id, *, now=None):
             }
             for row in plan["skipped"]
         ],
+        "pending_review": [
+            {"draft_id": row["draft_id"], "reason": row["reason"]}
+            for row in plan["pending_review"]
+        ],
     }
     run_id = db.next_public_id(conn, "extraction_runs", "run_id", "XR-")
     conn.execute(
@@ -1303,11 +1440,28 @@ def reextract_apply(conn, transcript_id, *, now=None):
         "run_id": run_id,
         "run": _list_extraction_runs(conn, transcript_id)[-1],
         "issue_ids": [i["issue_id"] for i in plan["issues"]],
-        "message": (
+        "pending_review": plan["pending_review"],
+        "pending_count": len(plan["pending_review"]),
+        "message": _reextract_message(plan, applied=True),
+    }
+
+
+def _reextract_message(plan, *, applied):
+    if applied:
+        text = (
             "已依來源位置補上新候選，狀態是草稿，沒有確認入帳。"
             "既有摘要、原文、審核狀態與已入帳事項沒有覆寫。"
-        ),
-    }
+        )
+    else:
+        text = (
+            "這是重新抽取的預覽，尚未寫入，也不會確認入帳。"
+            "只會列出來源位置還沒有草稿的候選。"
+            "既有摘要、原文、審核狀態與已入帳事項都不會被覆寫。"
+            "時間重新解析是另一個動作。"
+        )
+    if plan["pending_review"]:
+        text += "有舊草稿無法對到唯一的來源位置，已在結果標為待核對，沒有為它們新增草稿。"
+    return text
 
 
 def discard_draft(conn, draft_id, *, now=None):
