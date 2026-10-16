@@ -464,7 +464,7 @@ class TestReextract(Base):
         self.assertFalse(preview["applied"])
         self.assertEqual(preview["added_count"], 0)
         self.assertEqual(preview["skipped_count"], len(before_ids))
-        self.assertEqual(preview["extraction_method"], "rule:v4")
+        self.assertEqual(preview["extraction_method"], "rule:v5")
         self.assertEqual(preview["runs"], [])
         self.assertIn("尚未寫入", preview["message"])
         self.assertEqual(sorted(d["draft_id"] for d in transcripts.list_drafts(
@@ -472,7 +472,7 @@ class TestReextract(Base):
         first = transcripts.reextract_apply(self.conn, tid)
         self.assertTrue(first["applied"])
         self.assertEqual(first["added_count"], 0)
-        self.assertEqual(first["extraction_method"], "rule:v4")
+        self.assertEqual(first["extraction_method"], "rule:v5")
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["summary"], "人工改寫的虛構摘要")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["review_status"], "已確認")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["source_quote"], quote)
@@ -494,7 +494,7 @@ class TestReextract(Base):
         created = transcripts.get_draft(self.conn, applied["added_draft_ids"][0])
         self.assertEqual(created["review_status"], "草稿")
         self.assertEqual(created["sentence_index"], "2")
-        self.assertEqual(created["extraction_method"], "rule:v4")
+        self.assertEqual(created["extraction_method"], "rule:v5")
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["summary"], "人工改寫的虛構摘要")
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["sentence_index"], "1")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["source_quote"], quote)
@@ -507,9 +507,9 @@ class TestReextract(Base):
             "SELECT extraction_method, added_count, skipped_count FROM extraction_runs WHERE transcript_id=? ORDER BY run_id",
             (tid,)).fetchall()
         self.assertEqual([tuple(r) for r in runs], [
-            ("rule:v4", 0, len(before_ids)),
-            ("rule:v4", 1, len(before_ids)),
-            ("rule:v4", 0, len(before_ids) + 1),
+            ("rule:v5", 0, len(before_ids)),
+            ("rule:v5", 1, len(before_ids)),
+            ("rule:v5", 0, len(before_ids) + 1),
         ])
         draft_count = len(transcripts.list_drafts(self.conn, project_id=proj["project_id"], transcript_id=tid))
         transcripts.reparse_apply(self.conn, tid)
@@ -912,7 +912,7 @@ class TestSpokenRules(Base):
                 key,
             )
             self.assertFalse(cand["source_quote"].startswith("["))
-            self.assertEqual(cand["extraction_method"], "rule:v4")
+            self.assertEqual(cand["extraction_method"], "rule:v5")
             if cand["confidence"] != "高":
                 self.assertIn(cand["cue"], cand["reason"])
         self.assertEqual(by_pos[("18", 1)]["source_quote"], "那就這樣。")
@@ -963,6 +963,68 @@ class TestSpokenRules(Base):
             extra_cues={"decisions": ["核准過的版本"], "todos": []},
         )
         self.assertEqual(still, [])
+
+    def test_v5_loosens_you_first_and_keeps_price_and_past_out(self):
+        def one(text, method=None):
+            return transcripts.extract_candidates(
+                [{"source_segment_id": "1", "text": text, "location_label": "第 1 行"}],
+                method=method,
+            )
+
+        missed_by_v4 = [
+            "你們先看一下虛構點位。",
+            "你先檢查這面虛構盤。",
+            "就你們先把圖改一版。",
+            "你們這邊先出圖。",
+            "你先跟廠商對一下連鎖。",
+            "你們先看看告警文字，這個虛構盤的通訊位置跟線槽都還要再對過一遍才能收。",
+            "你們先寄給我們虛構的點表。",
+            "你先寫上這次的虛構修改。",
+        ]
+        also_v5 = [
+            "那你們先幫我們確認端子。",
+            "嗯，你們先就幫我們把這個點補上。",
+        ]
+        narrow = "你們先把連鎖條件列出來。"
+        for text in missed_by_v4 + also_v5 + [narrow]:
+            hit = one(text)
+            self.assertEqual(len(hit), 1, text)
+            self.assertEqual(
+                (hit[0]["kind"], hit[0]["cue"], hit[0]["confidence"], hit[0]["owner"], hit[0]["due_date"],
+                 hit[0]["extraction_method"]),
+                ("待辦", "你們先", "中", "", "", "rule:v5"),
+                text,
+            )
+            self.assertEqual(one(text, "rule:v2"), [], text)
+        for text in missed_by_v4:
+            self.assertEqual(one(text, "rule:v4"), [], text)
+
+        self.assertEqual([c["cue"] for c in one(narrow, "rule:v3")], ["你們先"])
+        self.assertEqual([c["cue"] for c in one(narrow, "rule:v4")], ["你們先"])
+
+        negatives = [
+            "你們先報個價就好。",
+            "你們先給個報價。",
+            "你們先看一下好嗎？",
+            "你們先不用改。",
+            "你們先前做過的圖就留著。",
+            "你先前做過的先別動。",
+            "如果你們先看一下呢？",
+            "你們先可能再改。",
+            "你們先把報價單整理一下。",
+            "我可以幫你弄，但是麻煩你多給一點預算。",
+            "麻煩你多給一點費用。",
+        ]
+        for text in negatives:
+            self.assertEqual(one(text), [], text)
+            self.assertEqual(one(text, "rule:v5"), [], text)
+
+        self.assertEqual([c["cue"] for c in one("你們先報個價就好。", "rule:v3")], ["你們先"])
+        self.assertEqual(one("你們先報個價就好。", "rule:v4"), [])
+        self.assertEqual([c["cue"] for c in one("我可以幫你弄，但是麻煩你多給一點預算。", "rule:v3")], ["麻煩"])
+        self.assertEqual(one("我可以幫你弄，但是麻煩你多給一點預算。", "rule:v4"), [])
+        asked = one("麻煩你們確認虛構點位。", "rule:v5")
+        self.assertEqual((asked[0]["cue"], asked[0]["owner"]), ("麻煩", ""))
 
     def test_local_cue_file_stays_off_the_terminal(self):
         phrase = "虛構收口講法甲"

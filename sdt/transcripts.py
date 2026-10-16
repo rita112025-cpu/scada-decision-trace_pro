@@ -16,16 +16,18 @@ from . import db
 RULE_V2 = "rule:v2"
 RULE_V3 = "rule:v3"
 RULE_V4 = "rule:v4"
-EXTRACTION_METHOD = RULE_V4
+RULE_V5 = "rule:v5"
+EXTRACTION_METHOD = RULE_V5
 LIMITATION = (
     "能力限制：此環境沒有可用的既有抽取器，也未呼叫外部 API 或下載模型。"
     "草稿只是可人工審核的候選，不是對會議的自動理解。"
-    "目前抽取版本是 rule:v4。明文標記（決議：、定案、決定採用、待辦、請＋姓名＋動作）仍沿用 rule:v2，信心標為高。"
+    "目前抽取版本是 rule:v5。明文標記（決議：、定案、決定採用、待辦、請＋姓名＋動作）仍沿用 rule:v2，信心標為高。"
     "口語定案與交辦信心標為中；本機說法清單對上的標為低。"
     "「麻煩」要後面接著對象和動作（例如確認、提供、回覆、更新、補）才列為待辦。"
     "談預算、報價、費用，以及「但是麻煩」這種有條件的請求，不列為待辦。"
-    "「你們先」也要接著動作；「那就這樣」若在談價錢或帶著「但是」，不當成定案。"
-    "問句、假設、建議、否定、取消，以及「核准過」「之前已經」這類過去的事，不列為候選。"
+    "「你們先」「你先」「你們這邊先」後面接常見動作才列為待辦；句子長或口語本身不構成排除。"
+    "問句、假設、建議、否定、取消、報價議價，以及「核准過」「之前已經」「你們先前」這類過去的事，不列為候選。"
+    "「那就這樣」若在談價錢或帶著「但是」，不當成定案。"
     "「然後就是核准過的版本」這種歷史敘述不是這次的決議。很短的應聲（對、嗯、好、OK）也不列。"
     "負責人與期限只有這一句明文寫出才填，不依講者或前後文猜測。"
     "同一句若同時像決議又像交辦，只產生一筆決議草稿。"
@@ -635,6 +637,19 @@ _TROUBLE_V4 = re.compile(
 _YOU_FIRST_V4 = re.compile(
     rf"你們先(?:把|再|去|幫)?[^。！？!?]{{0,24}}?(?:{_ACTION})"
 )
+# v5：你們先／你先／你們這邊先，可帶「那／就」與短填充，再接到常見動作。
+# 「你們先前」是過去式，不當成「你們先」。句子其餘部分多長都不在這裡擋。
+_YOU_FIRST_V5_VERBS = (
+    "看一下|對一下|看看|出圖|確認|檢查|整理|提供|修改|更新|回覆|詢問|評估|測試|準備|安排|"
+    "跟[^。！？!?]{0,8}?對|"
+    "補|列|寄|傳|給|改|問|做|弄|拉|畫(?!面)|寫"
+)
+_YOU_FIRST_V5 = re.compile(
+    r"(?:那|就)?(?:你們這邊先|你們先|你先)(?!前)"
+    r"(?:(?:就|那|嗯|把|再|去|幫我們|幫|請)[，,\s]*){0,4}"
+    rf"[^。！？!?]{{0,8}}?(?:{_YOU_FIRST_V5_VERBS})"
+)
+_QUOTE = re.compile(r"報個價|報.{0,2}價")
 
 
 def _core_len(sentence):
@@ -670,13 +685,22 @@ def _decision_cue(sentence, *, tightened=False):
     return ""
 
 
-def _todo_cue(sentence, *, tightened=False):
-    """rule:v3 的「麻煩」「你們先」較寬。rule:v4 要有對象與動作，並排除議價與有條件的請求。"""
+def _price_context(sentence):
+    return _MONEY.search(sentence) is not None or _QUOTE.search(sentence) is not None
+
+
+def _todo_cue(sentence, *, method):
+    """v3 的「麻煩」「你們先」較寬。v4 起「麻煩」要有對象與動作。
+
+    v4 的「你們先」只接較短的動作清單。v5 放寬成常見工程交辦動詞，
+    仍排除問句以外、由呼叫端先擋下的假設／否定／過去，以及報價議價。
+    """
+    tight_trouble = method in {RULE_V4, RULE_V5}
     for cue in _TODO_CUES:
         if cue == "麻煩":
             if re.search(r"(?:比較|很|太|有點|真|稍|不)麻煩", sentence):
                 continue
-            if tightened:
+            if tight_trouble:
                 if _CONDITIONAL_ASK.search(sentence) or _MONEY.search(sentence):
                     continue
                 if _TROUBLE_V4.search(sentence):
@@ -686,10 +710,16 @@ def _todo_cue(sentence, *, tightened=False):
                 return cue
             continue
         if cue == "你們先":
-            if tightened:
+            if method == RULE_V4:
                 if _CONDITIONAL_ASK.search(sentence) or _MONEY.search(sentence):
                     continue
                 if _YOU_FIRST_V4.search(sentence):
+                    return cue
+                continue
+            if method == RULE_V5:
+                if _price_context(sentence):
+                    continue
+                if _YOU_FIRST_V5.search(sentence):
                     return cue
                 continue
             if cue in sentence:
@@ -783,7 +813,7 @@ def _spoken_hit(kind, rule_id, cue, confidence, source, also_todo):
 
 
 def _classify_candidate(sentence, method, extra_cues):
-    """rule:v2 只看明文標記。rule:v3／v4 在同一套標記之後才收口語。v4 再收緊寬說法。"""
+    """rule:v2 只看明文標記。v3 起才收口語。v4 收緊寬說法，v5 放寬「你們先」。"""
     decision = _decision_rule(sentence)
     todo = _todo_rule(sentence)
     if decision:
@@ -799,9 +829,9 @@ def _classify_candidate(sentence, method, extra_cues):
         return _explicit_hit("待辦", rule_id, reason, False)
     if _colloquial_blocked(sentence):
         return None
-    tightened = method == RULE_V4
+    tightened = method in {RULE_V4, RULE_V5}
     cue = _decision_cue(sentence, tightened=tightened)
-    todo_cue = _todo_cue(sentence, tightened=tightened)
+    todo_cue = _todo_cue(sentence, method=method)
     local_decision = _local_cue(sentence, (extra_cues or {}).get("decisions"))
     local_todo = _local_cue(sentence, (extra_cues or {}).get("todos"))
     if cue:
@@ -847,11 +877,11 @@ def extract_candidates(segments, method=None, extra_cues=None):
     """由段落產生候選草稿。同一句最多一筆；不會把草稿寫進正式台帳。
 
     前後段只在本句已有候選、且出現指代時附上，用來給人核對。不用前後段多收草稿，
-    也不把多段原文接成一句。    method 可指定 rule:v2 或 rule:v3，用來重現舊版；省略時用 rule:v4。
-    extra_cues 只在 v3／v4 生效，問句與歷史敘述仍然先被擋下。
+    也不把多段原文接成一句。method 可指定 rule:v2、rule:v3 或 rule:v4，用來重現舊版；省略時用 rule:v5。
+    extra_cues 只在 v3 以後生效，問句與歷史敘述仍然先被擋下。
     """
     method = method or EXTRACTION_METHOD
-    if method not in {RULE_V2, RULE_V3, RULE_V4}:
+    if method not in {RULE_V2, RULE_V3, RULE_V4, RULE_V5}:
         raise db.ValidationError([f"未知的抽取版本 {method}"])
     cues = None if method == RULE_V2 else extra_cues
     ordered = list(segments)
