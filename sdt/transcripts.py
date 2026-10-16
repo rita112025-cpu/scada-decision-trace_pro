@@ -594,7 +594,8 @@ def extract_candidates(segments):
     found = []
     seen = set()
     for index, seg in enumerate(ordered):
-        for sentence in _sentences(seg.get("text") or ""):
+        source_id = str(seg.get("source_segment_id") or f"#{index}")
+        for sentence_index, sentence in enumerate(_sentences(seg.get("text") or ""), start=1):
             decision = _decision_rule(sentence)
             todo = _todo_rule(sentence)
             if decision:
@@ -605,7 +606,8 @@ def extract_candidates(segments):
                 rule_id, reason = todo
             else:
                 continue
-            key = (kind, sentence)
+            # 同一來源位置只留一筆（決議優先）。相同句子出現在別的段落要各自保留。
+            key = (source_id, sentence_index)
             if key in seen:
                 continue
             seen.add(key)
@@ -615,12 +617,14 @@ def extract_candidates(segments):
             if _ANAPHORA.search(sentence) and index > 0:
                 context.append(_context_ref(ordered[index - 1]))
             found.append({
-                "segment_key": seg["source_segment_id"],
+                "segment_key": source_id,
+                "segment_id": seg.get("segment_id") or "",
+                "sentence_index": sentence_index,
                 "kind": kind,
                 "summary": sentence,
                 "source_quote": sentence,
-                "location_label": seg["location_label"],
-                "timestamp_label": seg["timestamp_label"],
+                "location_label": seg.get("location_label") or "",
+                "timestamp_label": seg.get("timestamp_label") or "",
                 "owner": owner,
                 "owner_origin": "原文" if owner else "未指定",
                 "due_date": due,
@@ -653,6 +657,26 @@ def _public_draft(row):
         refs = []
     item["context_refs"] = refs if isinstance(refs, list) else []
     return item
+
+
+def _insert_draft(conn, *, project_id, transcript_id, segment_id, cand, when):
+    """新增一筆草稿。不改既有草稿，也不確認入帳。"""
+    did = db.next_public_id(conn, "drafts", "draft_id", "DR-")
+    conn.execute(
+        """INSERT INTO drafts(
+            draft_id, project_id, transcript_id, segment_id, kind, summary, source_quote,
+            location_label, timestamp_label, extraction_method, limitation, owner, owner_origin,
+            due_date, due_origin, review_status, issue_id, rule_id, reason, review_gaps,
+            context_refs, sentence_index, created_at, updated_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (did, project_id, transcript_id, segment_id, cand["kind"], cand["summary"],
+         cand["source_quote"], cand["location_label"], cand["timestamp_label"],
+         cand["extraction_method"], cand["limitation"], cand["owner"], cand["owner_origin"],
+         cand["due_date"], cand["due_origin"], "草稿", "", cand.get("rule_id") or "",
+         cand.get("reason") or "", cand.get("review_gaps") or "",
+         json.dumps(cand.get("context_refs") or [], ensure_ascii=False),
+         str(cand.get("sentence_index") or ""), when, when))
+    return get_draft(conn, did)
 
 
 def import_transcript(conn, *, project_id, filename, content_base64, operator, now=None):
@@ -702,21 +726,9 @@ def import_transcript(conn, *, project_id, filename, content_base64, operator, n
     drafts = []
     for cand in extract_candidates(saved_segments):
         seg = next(s for s in saved_segments if s["source_segment_id"] == cand["segment_key"])
-        did = db.next_public_id(conn, "drafts", "draft_id", "DR-")
-        conn.execute(
-            """INSERT INTO drafts(
-                draft_id, project_id, transcript_id, segment_id, kind, summary, source_quote,
-                location_label, timestamp_label, extraction_method, limitation, owner, owner_origin,
-                due_date, due_origin, review_status, issue_id, rule_id, reason, review_gaps,
-                context_refs, created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (did, project["project_id"], tid, seg["segment_id"], cand["kind"], cand["summary"],
-             cand["source_quote"], cand["location_label"], cand["timestamp_label"],
-             cand["extraction_method"], cand["limitation"], cand["owner"], cand["owner_origin"],
-             cand["due_date"], cand["due_origin"], "草稿", "", cand.get("rule_id") or "",
-             cand.get("reason") or "", cand.get("review_gaps") or "",
-             json.dumps(cand.get("context_refs") or [], ensure_ascii=False), when, when))
-        drafts.append(get_draft(conn, did))
+        drafts.append(_insert_draft(
+            conn, project_id=project["project_id"], transcript_id=tid,
+            segment_id=seg["segment_id"], cand=cand, when=when))
     message = f"已匯入 {tid}，產生 {len(drafts)} 筆草稿。草稿尚未進入正式台帳。"
     if not drafts:
         message += "這份逐字稿沒有符合規則的決議或待辦候選。"
@@ -1063,6 +1075,238 @@ def reparse_apply(conn, transcript_id, *, now=None):
         "drafts": [{"draft_id": d["draft_id"], "review_status": status_before[d["draft_id"]]} for d in plan["drafts"]],
         "issue_ids": list(issue_quotes),
         "message": "已重新解析時間。原始行、草稿審核狀態、事項與原始引用仍在。新出現的行只補段落，不自動產生草稿，也不入帳。",
+    }
+
+
+def _prepare_segment(seg):
+    item = dict(seg)
+    if not item.get("location_label"):
+        line = item.get("line_start")
+        label = item.get("timestamp_label") or ""
+        item["location_label"] = f"第 {line} 行　{label}" if line else (item.get("source_segment_id") or "")
+    item["source_segment_id"] = str(item.get("source_segment_id") or "")
+    return item
+
+
+def _list_extraction_runs(conn, transcript_id):
+    rows = conn.execute(
+        """SELECT run_id, transcript_id, extraction_method, created_at, added_count, skipped_count
+           FROM extraction_runs WHERE transcript_id=? ORDER BY run_id""",
+        (transcript_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _reextract_plan(conn, transcript_id):
+    """比對目前規則與既有草稿。不寫入。
+
+    已有句子位置的草稿佔住 (段落, 句序)。沒有句子位置的舊草稿改以段落加原文一對一配對，
+    不回填、不覆寫。對不上的新位置才會列為可新增。
+    """
+    item = get_transcript(conn, transcript_id)
+    stored = list_segments(conn, transcript_id)
+    prepared = [_prepare_segment(seg) for seg in stored]
+    candidates = extract_candidates(prepared)
+    drafts = [_public_draft(r) for r in conn.execute(
+        "SELECT * FROM drafts WHERE transcript_id=? ORDER BY draft_id", (transcript_id,))]
+    issues = [dict(r) for r in conn.execute(
+        "SELECT issue_id, source_quote FROM issues WHERE transcript_id=?", (transcript_id,))]
+    positioned = {}
+    legacy = {}
+    for draft in drafts:
+        index = str(draft.get("sentence_index") or "")
+        if index:
+            positioned[(draft["segment_id"], index)] = draft
+        else:
+            legacy.setdefault((draft["segment_id"], draft["source_quote"]), []).append(draft)
+    by_id = {seg["segment_id"]: seg for seg in prepared if seg.get("segment_id")}
+    added = []
+    skipped = []
+    claimed = set(positioned)
+    for cand in candidates:
+        seg = by_id.get(cand.get("segment_id") or "")
+        if seg is None:
+            matches = [s for s in prepared if s.get("source_segment_id") == cand["segment_key"]]
+            seg = matches[0] if len(matches) == 1 else None
+        sentence_index = str(cand["sentence_index"])
+        base = {
+            "sentence_index": sentence_index,
+            "kind": cand["kind"],
+            "rule_id": cand["rule_id"],
+            "line": (seg or {}).get("line_start") or "",
+            "source_quote": cand["source_quote"],
+        }
+        if seg is None or not seg.get("segment_id"):
+            skipped.append(dict(base, segment_id="", draft_id="", reason="not_found"))
+            continue
+        pos = (seg["segment_id"], sentence_index)
+        base["segment_id"] = seg["segment_id"]
+        if pos in claimed:
+            holder = positioned.get(pos)
+            skipped.append(dict(
+                base, draft_id=holder["draft_id"] if holder else "", reason="position"))
+            continue
+        bucket = legacy.get((seg["segment_id"], cand["source_quote"])) or []
+        if bucket:
+            holder = bucket.pop(0)
+            claimed.add(pos)
+            skipped.append(dict(base, draft_id=holder["draft_id"], reason="legacy_quote"))
+            continue
+        added.append(dict(base, candidate=cand))
+        claimed.add(pos)
+    return {
+        "transcript": item,
+        "segments": stored,
+        "drafts": drafts,
+        "issues": issues,
+        "added": added,
+        "skipped": skipped,
+    }
+
+
+def _public_extract_row(row):
+    return {
+        "segment_id": row.get("segment_id") or "",
+        "sentence_index": row.get("sentence_index") or "",
+        "kind": row.get("kind") or "",
+        "rule_id": row.get("rule_id") or "",
+        "line": row.get("line") or "",
+        "source_quote": row.get("source_quote") or "",
+        "draft_id": row.get("draft_id") or "",
+        "reason": row.get("reason") or "",
+    }
+
+
+def reextract_preview(conn, transcript_id):
+    """預覽重新抽取。不寫入、不改既有草稿、不確認入帳。"""
+    plan = _reextract_plan(conn, transcript_id)
+    return {
+        "transcript_id": transcript_id,
+        "applied": False,
+        "extraction_method": EXTRACTION_METHOD,
+        "added_count": len(plan["added"]),
+        "skipped_count": len(plan["skipped"]),
+        "kept_count": len(plan["drafts"]),
+        "added": [_public_extract_row(row) for row in plan["added"]],
+        "skipped": [_public_extract_row(row) for row in plan["skipped"]],
+        "existing_drafts": [
+            {
+                "draft_id": d["draft_id"],
+                "review_status": d["review_status"],
+                "sentence_index": d.get("sentence_index") or "",
+            }
+            for d in plan["drafts"]
+        ],
+        "issue_ids": [i["issue_id"] for i in plan["issues"]],
+        "runs": _list_extraction_runs(conn, transcript_id),
+        "message": (
+            "這是重新抽取的預覽，尚未寫入，也不會確認入帳。"
+            "只會列出來源位置還沒有草稿的候選。"
+            "既有摘要、原文、審核狀態與已入帳事項都不會被覆寫。"
+            "時間重新解析是另一個動作。"
+        ),
+    }
+
+
+def _freeze_reextract(plan):
+    return {
+        "drafts": {
+            d["draft_id"]: (
+                d["summary"], d["source_quote"], d["review_status"], str(d.get("sentence_index") or ""),
+            )
+            for d in plan["drafts"]
+        },
+        "issues": {i["issue_id"]: i["source_quote"] for i in plan["issues"]},
+        "raw_text": plan["transcript"]["raw_text"],
+        "segments": [
+            (s["segment_id"], s["text"], s["raw_text"], s.get("start_seconds") or "", s.get("end_seconds") or "")
+            for s in plan["segments"]
+        ],
+    }
+
+
+def _assert_reextract_unchanged(conn, transcript_id, frozen):
+    for draft_id, previous in frozen["drafts"].items():
+        row = conn.execute(
+            "SELECT summary, source_quote, review_status, sentence_index FROM drafts WHERE draft_id=?",
+            (draft_id,)).fetchone()
+        current = (row["summary"], row["source_quote"], row["review_status"], row["sentence_index"] or "")
+        if current != previous:
+            raise db.ValidationError(["重新抽取改到了既有草稿，已中止"])
+    for issue_id, quote in frozen["issues"].items():
+        row = conn.execute("SELECT source_quote FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
+        if row["source_quote"] != quote:
+            raise db.ValidationError(["重新抽取改到了已入帳事項，已中止"])
+    stored = get_transcript(conn, transcript_id)
+    if stored["raw_text"] != frozen["raw_text"]:
+        raise db.ValidationError(["重新抽取改到了逐字稿原文，已中止"])
+    segments = [
+        (s["segment_id"], s["text"], s["raw_text"], s.get("start_seconds") or "", s.get("end_seconds") or "")
+        for s in list_segments(conn, transcript_id)
+    ]
+    if segments != frozen["segments"]:
+        raise db.ValidationError(["重新抽取改到了逐字稿段落，已中止"])
+
+
+def reextract_apply(conn, transcript_id, *, now=None):
+    """補上來源位置還沒有的候選。不覆寫既有草稿與事項，不自動確認入帳。"""
+    plan = _reextract_plan(conn, transcript_id)
+    frozen = _freeze_reextract(plan)
+    when = now or db.now_str()
+    transcript = plan["transcript"]
+    new_ids = []
+    for row in plan["added"]:
+        draft = _insert_draft(
+            conn, project_id=transcript["project_id"], transcript_id=transcript_id,
+            segment_id=row["segment_id"], cand=row["candidate"], when=when)
+        if draft["review_status"] != "草稿":
+            raise db.ValidationError(["重新抽取不應確認入帳，已中止"])
+        new_ids.append(draft["draft_id"])
+    _assert_reextract_unchanged(conn, transcript_id, frozen)
+    detail = {
+        "added": [
+            {
+                "draft_id": draft_id,
+                "segment_id": row["segment_id"],
+                "sentence_index": row["sentence_index"],
+                "kind": row["kind"],
+                "rule_id": row["rule_id"],
+            }
+            for draft_id, row in zip(new_ids, plan["added"])
+        ],
+        "skipped": [
+            {
+                "draft_id": row.get("draft_id") or "",
+                "segment_id": row.get("segment_id") or "",
+                "sentence_index": row.get("sentence_index") or "",
+                "kind": row.get("kind") or "",
+                "rule_id": row.get("rule_id") or "",
+                "reason": row.get("reason") or "",
+            }
+            for row in plan["skipped"]
+        ],
+    }
+    run_id = db.next_public_id(conn, "extraction_runs", "run_id", "XR-")
+    conn.execute(
+        """INSERT INTO extraction_runs(
+            run_id, transcript_id, extraction_method, created_at, added_count, skipped_count, detail
+        ) VALUES (?,?,?,?,?,?,?)""",
+        (run_id, transcript_id, EXTRACTION_METHOD, when, len(new_ids), len(plan["skipped"]),
+         json.dumps(detail, ensure_ascii=False)))
+    return {
+        "transcript_id": transcript_id,
+        "applied": True,
+        "extraction_method": EXTRACTION_METHOD,
+        "added_count": len(new_ids),
+        "skipped_count": len(plan["skipped"]),
+        "kept_count": len(plan["drafts"]),
+        "added_draft_ids": new_ids,
+        "run_id": run_id,
+        "run": _list_extraction_runs(conn, transcript_id)[-1],
+        "issue_ids": [i["issue_id"] for i in plan["issues"]],
+        "message": (
+            "已依來源位置補上新候選，狀態是草稿，沒有確認入帳。"
+            "既有摘要、原文、審核狀態與已入帳事項沒有覆寫。"
+        ),
     }
 
 

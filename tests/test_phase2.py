@@ -1,12 +1,17 @@
-"""第二階段：TXT 時間、口語候選與重新解析。只用虛構句子。"""
+"""第二階段：TXT 時間、口語候選、重新解析與重新抽取。只用虛構句子。"""
 import base64
+import json
+import os
 import pathlib
 import shutil
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 
-from sdt import db, transcripts
-from scripts.verify_local import score_kind, verify
+from sdt import config, db, server, transcripts
+from scripts.verify_local import evaluate_score, verify
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 EXAMPLES = ROOT / "examples" / "synthetic"
@@ -121,6 +126,34 @@ class TestColloquialRules(Base):
         assigned = next(d for d in result["drafts"] if "林示範" in d["source_quote"])
         self.assertEqual((assigned["owner"], assigned["due_date"]), ("林示範", "2026-12-01"))
         self.assertEqual(db.list_issues(self.conn), [])
+        self.assertTrue(all(d["sentence_index"] == "1" for d in result["drafts"]))
+
+    def test_same_wording_in_different_segments_keeps_each_context(self):
+        segments = []
+        texts = [
+            "通訊模組就放在虛構盤的右側。",
+            "就照這樣定案。",
+            "端子改放在虛構盤的左側。",
+            "就照這樣定案。就照這樣定案。",
+        ]
+        for i, text in enumerate(texts, start=1):
+            segments.append({
+                "source_segment_id": str(i),
+                "text": text,
+                "raw_text": text,
+                "location_label": f"第 {i} 行",
+                "timestamp_label": "無時間資訊",
+            })
+        found = transcripts.extract_candidates(segments)
+        hits = [c for c in found if c["source_quote"] == "就照這樣定案。"]
+        self.assertEqual([(c["segment_key"], c["sentence_index"]) for c in hits], [
+            ("2", 1), ("4", 1), ("4", 2),
+        ])
+        self.assertIn("右側", hits[0]["context_refs"][0]["text"])
+        self.assertIn("左側", hits[1]["context_refs"][0]["text"])
+        self.assertIn("左側", hits[2]["context_refs"][0]["text"])
+        self.assertNotIn("右側", hits[1]["source_quote"])
+        self.assertNotIn("左側", hits[0]["context_refs"][0]["text"])
 
     def test_summary_edit_does_not_replace_quote(self):
         proj = self.project()
@@ -224,20 +257,316 @@ class TestLocalVerifier(unittest.TestCase):
             self.assertIn("人工判定的誤收", text)
             self.assertIn("precision", text)
             self.assertIn("recall", text)
-            self.assertRegex(text, r"決議 precision \d+/\d+")
-            self.assertRegex(text, r"待辦 precision \d+/\d+")
+            result = verify(folder)
+            text = result["text"]
+            self.assertEqual(result["scored"], 1)
+            self.assertEqual(result["refused"], 0)
+            self.assertIn("待核對參考", text)
+            self.assertIn("沒有讀取內文", text)
+            self.assertIn("待確認", text)
+            self.assertIn("人工判定的誤收", text)
+            self.assertIn("一對一", text)
+            self.assertIn("決議 precision 1/3", text)
+            self.assertIn("決議 precision 1/3（分子是與標註一對一對上的候選數，分母是該類候選數）； recall 1/1", text)
+            self.assertIn("待辦 precision 2/2", text)
             self.assertIn("recall 2/2", text)
-        predicted = [
-            {"kind": "決議", "line": "11"},
-            {"kind": "決議", "line": "2"},
-            {"kind": "待辦", "line": "13"},
-        ]
-        gold = [
-            {"kind": "決議", "line": "11"},
-            {"kind": "待辦", "line": "12"},
-            {"kind": "待辦", "line": "13"},
-        ]
-        decision = score_kind("決議", gold, predicted)
+
+    def test_cross_file_same_line_pairs_by_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            (folder / "fictional-a.txt").write_text("[00:01:00] 決議：採用虛構甲盤。\n", encoding="utf-8")
+            (folder / "fictional-b.txt").write_text("[00:01:00] 決議：採用虛構乙盤。\n", encoding="utf-8")
+            (folder / "annotation.json").write_text(json.dumps({
+                "items": [{"kind": "決議", "file": "fictional-a.txt", "line": 1, "sentence": 1}],
+            }), encoding="utf-8")
+            result = verify(folder)
+        decision = result["score"]["by_kind"]["決議"]
         self.assertEqual((decision["precision"], decision["recall"]), ("1/2", "1/1"))
-        todo = score_kind("待辦", gold, predicted)
-        self.assertEqual((todo["precision"], todo["recall"]), ("1/1", "1/2"))
+        self.assertEqual(result["matched_total"] if "matched_total" in result else result["score"]["matched_total"], 1)
+
+    def test_multiple_sentences_on_one_line_use_sentence_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            (folder / "fictional-line.txt").write_text(
+                "[00:01:00] 決議：採用虛構甲盤。決議：採用虛構乙盤。\n", encoding="utf-8")
+            (folder / "annotation.json").write_text(json.dumps({
+                "items": [{"kind": "決議", "file": "fictional-line.txt", "line": 1, "sentence": 2}],
+            }), encoding="utf-8")
+            result = verify(folder)
+        decision = result["score"]["by_kind"]["決議"]
+        self.assertEqual((decision["precision"], decision["recall"]), ("1/2", "1/1"))
+
+    def test_duplicate_or_unclear_annotation_refuses_score(self):
+        locations = {"fictional-a.txt": {"1": 1}, "fictional-line.txt": {"1": None}}
+        hit = {"kind": "決議", "file": "fictional-a.txt", "line": "1", "sentence": "1"}
+        duplicate = evaluate_score([hit, dict(hit)], [hit], locations)
+        self.assertFalse(duplicate["ok"])
+        self.assertEqual(duplicate["matched_total"], 0)
+        self.assertTrue(any(p["code"] == "duplicate" for p in duplicate["problems"]))
+        missing_sentence = evaluate_score(
+            [{"kind": "決議", "file": "fictional-a.txt", "line": "1", "sentence": ""}], [hit], locations)
+        self.assertEqual(missing_sentence["matched_total"], 0)
+        self.assertTrue(any(p["code"] == "missing_sentence" for p in missing_sentence["problems"]))
+        missing_file = evaluate_score(
+            [{"kind": "決議", "file": "", "line": "1", "sentence": "1"}], [hit], locations)
+        self.assertTrue(any(p["code"] == "missing_file" for p in missing_file["problems"]))
+        self.assertEqual(missing_file["matched_total"], 0)
+        out_of_range = evaluate_score(
+            [{"kind": "決議", "file": "fictional-a.txt", "line": "1", "sentence": "9"}], [hit], locations)
+        self.assertTrue(any(p["code"] == "not_found" for p in out_of_range["problems"]))
+        self.assertEqual(out_of_range["matched_total"], 0)
+        ambiguous = evaluate_score(
+            [{"kind": "決議", "file": "fictional-line.txt", "line": "1", "sentence": "1"}], [hit], locations)
+        self.assertTrue(any(p["code"] == "ambiguous_line" for p in ambiguous["problems"]))
+        self.assertEqual(ambiguous["matched_total"], 0)
+        dup_pred = evaluate_score([hit], [hit, dict(hit)], locations)
+        self.assertTrue(any(p["code"] == "duplicate_prediction" for p in dup_pred["problems"]))
+        self.assertEqual(dup_pred["matched_total"], 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp)
+            (folder / "fictional-a.txt").write_text("[00:01:00] 決議：採用虛構甲盤。\n", encoding="utf-8")
+            (folder / "annotation.json").write_text(json.dumps({"items": [
+                {"kind": "決議", "file": "fictional-a.txt", "line": 1, "sentence": 1},
+                {"kind": "決議", "file": "fictional-a.txt", "line": 1, "sentence": 1, "note": "重複的虛構標註"},
+            ]}), encoding="utf-8")
+            result = verify(folder)
+            self.assertEqual(result["scored"], 0)
+            self.assertGreater(result["refused"], 0)
+            self.assertIn("拒絕評分", result["text"])
+            self.assertIn("沒有算成命中", result["text"])
+            self.assertIn("重複標註", result["text"])
+            self.assertNotRegex(result["text"], r"precision \d+/\d+")
+            (folder / "annotation.json").write_text(json.dumps({"items": [
+                {"kind": "決議", "file": "fictional-a.txt", "line": 1, "note": "只有行號的虛構標註"},
+            ]}), encoding="utf-8")
+            unclear = verify(folder)
+            self.assertEqual(unclear["scored"], 0)
+            self.assertEqual(unclear["score"]["matched_total"], 0)
+            self.assertIn("缺少句子位置", unclear["text"])
+            self.assertIn("沒有算成命中", unclear["text"])
+            self.assertNotRegex(unclear["text"], r"precision \d+/\d+")
+
+
+def _run_verify(args, env):
+    return subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "verify_local.py"), *args],
+        capture_output=True, text=True, env=env, cwd=str(ROOT),
+    )
+
+
+class TestVerifierTerminal(unittest.TestCase):
+    def test_success_and_failure_hide_sensitive_marker(self):
+        marker = "虛構敏感標記甲"
+        env = os.environ.copy()
+        env.pop("SDT_VERIFY_DIR", None)
+        env["PYTHONIOENCODING"] = "utf-8"
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = pathlib.Path(tmp) / marker
+            folder.mkdir()
+            name = f"{marker}.txt"
+            (folder / name).write_text(f"[00:01:00] {marker}就照這樣定案。\n", encoding="utf-8")
+            (folder / "annotation.json").write_text(json.dumps({"items": [
+                {"kind": "決議", "file": name, "line": 1, "sentence": 1, "note": marker},
+            ]}), encoding="utf-8")
+            (folder / "pending.json").write_text(json.dumps({
+                "items": [{"kind": "待辦", "note": marker}],
+            }), encoding="utf-8")
+            (folder / "false-positives.json").write_text(json.dumps({
+                "items": [{"kind": "決議", "file": name, "line": 1, "sentence": 1, "note": marker}],
+            }), encoding="utf-8")
+            proc = _run_verify(["--dir", str(folder)], env)
+            combined = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, combined)
+            self.assertEqual(proc.stderr, "")
+            self.assertNotIn(marker, combined)
+            self.assertNotIn(str(folder), combined)
+            self.assertNotIn(name, combined)
+            self.assertNotIn("定案", combined)
+            self.assertNotIn("verify-report", combined)
+            self.assertIn("status=0", proc.stdout)
+            self.assertIn("files=1", proc.stdout)
+            self.assertIn("scored=1", proc.stdout)
+            self.assertIn("refused=0", proc.stdout)
+            report = (folder / "reports" / "verify-report.txt").read_text(encoding="utf-8")
+            self.assertIn(marker, report)
+            self.assertIn(name, report)
+
+            missing = _run_verify(["--dir", str(folder / marker)], env)
+            missing_out = missing.stdout + missing.stderr
+            self.assertEqual(missing.returncode, 2)
+            self.assertIn("status=2", missing.stderr)
+            self.assertIn("error=missing_dir", missing.stderr)
+            self.assertNotIn(marker, missing_out)
+            self.assertNotIn(str(folder), missing_out)
+
+            (folder / name).write_bytes(marker.encode("utf-8") + b"\xff")
+            bad_text = _run_verify(["--dir", str(folder)], env)
+            bad_out = bad_text.stdout + bad_text.stderr
+            self.assertEqual(bad_text.returncode, 2)
+            self.assertIn("error=not_utf8", bad_text.stderr)
+            self.assertNotIn(marker, bad_out)
+            self.assertNotIn(name, bad_out)
+
+            (folder / name).write_text("[00:01:00] 一句虛構。\n", encoding="utf-8")
+            (folder / "annotation.json").write_text("{" + marker, encoding="utf-8")
+            bad_json = _run_verify(["--dir", str(folder)], env)
+            json_out = bad_json.stdout + bad_json.stderr
+            self.assertEqual(bad_json.returncode, 2)
+            self.assertIn("error=bad_annotation", bad_json.stderr)
+            self.assertNotIn(marker, json_out)
+            self.assertNotIn(str(folder), json_out)
+
+            (folder / "annotation.json").write_text(json.dumps({"items": [
+                {"kind": "決議", "file": name, "line": marker, "sentence": 1},
+            ]}), encoding="utf-8")
+            bad_line = _run_verify(["--dir", str(folder)], env)
+            line_out = bad_line.stdout + bad_line.stderr
+            self.assertEqual(bad_line.returncode, 2)
+            self.assertIn("error=bad_annotation", bad_line.stderr)
+            self.assertNotIn(marker, line_out)
+
+            unknown = _run_verify([marker], env)
+            unknown_out = unknown.stdout + unknown.stderr
+            self.assertEqual(unknown.returncode, 2)
+            self.assertIn("error=failed", unknown.stderr)
+            self.assertNotIn(marker, unknown_out)
+
+        bare = _run_verify([], env)
+        bare_out = bare.stdout + bare.stderr
+        self.assertEqual(bare.returncode, 2)
+        self.assertIn("error=missing_dir", bare.stderr)
+        self.assertNotIn("sdt-verify", bare_out)
+        self.assertNotIn("Users", bare_out)
+
+
+class TestReextract(Base):
+    def test_reextract_keeps_existing_rows_and_adds_by_position(self):
+        proj = self.project()
+        imported = self.import_example("meeting-colloquial.txt", proj["project_id"])
+        tid = imported["transcript_id"]
+        draft = next(d for d in imported["drafts"] if d["rule_id"] == "D1")
+        other = next(d for d in imported["drafts"] if d["draft_id"] != draft["draft_id"])
+        transcripts.update_draft(self.conn, other["draft_id"], {"summary": "人工改寫的虛構摘要"})
+        confirmed = transcripts.confirm_draft(self.conn, draft["draft_id"], "測試員")
+        issue_id = confirmed["issue"]["issue_id"]
+        quote = draft["source_quote"]
+        raw = transcripts.get_transcript(self.conn, tid)["raw_text"]
+        before_ids = sorted(d["draft_id"] for d in imported["drafts"])
+        preview = transcripts.reextract_preview(self.conn, tid)
+        self.assertFalse(preview["applied"])
+        self.assertEqual(preview["added_count"], 0)
+        self.assertEqual(preview["skipped_count"], len(before_ids))
+        self.assertEqual(preview["extraction_method"], "rule:v2")
+        self.assertEqual(preview["runs"], [])
+        self.assertIn("尚未寫入", preview["message"])
+        self.assertEqual(sorted(d["draft_id"] for d in transcripts.list_drafts(
+            self.conn, project_id=proj["project_id"], transcript_id=tid)), before_ids)
+        first = transcripts.reextract_apply(self.conn, tid)
+        self.assertTrue(first["applied"])
+        self.assertEqual(first["added_count"], 0)
+        self.assertEqual(first["extraction_method"], "rule:v2")
+        self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["summary"], "人工改寫的虛構摘要")
+        self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["review_status"], "已確認")
+        self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["source_quote"], quote)
+        self.assertEqual(db.get_issue(self.conn, issue_id)["source_quote"], quote)
+        self.assertEqual(transcripts.get_transcript(self.conn, tid)["raw_text"], raw)
+        self.assertEqual(len(db.list_issues(self.conn)), 1)
+        segment = next(s for s in transcripts.list_segments(self.conn, tid) if s["text"] == "就照這樣定案。")
+        self.conn.execute(
+            "UPDATE transcript_segments SET text=? WHERE segment_id=?",
+            (segment["text"] + "決議：另定虛構項目。", segment["segment_id"]))
+        self.conn.commit()
+        again = transcripts.reextract_preview(self.conn, tid)
+        self.assertEqual(again["added_count"], 1)
+        self.assertEqual(again["added"][0]["rule_id"], "D1")
+        self.assertEqual(again["added"][0]["sentence_index"], "2")
+        self.assertIn("另定虛構項目", again["added"][0]["source_quote"])
+        applied = transcripts.reextract_apply(self.conn, tid)
+        self.assertEqual(applied["added_count"], 1)
+        created = transcripts.get_draft(self.conn, applied["added_draft_ids"][0])
+        self.assertEqual(created["review_status"], "草稿")
+        self.assertEqual(created["sentence_index"], "2")
+        self.assertEqual(created["extraction_method"], "rule:v2")
+        self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["summary"], "人工改寫的虛構摘要")
+        self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["sentence_index"], "1")
+        self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["source_quote"], quote)
+        self.assertEqual(db.get_issue(self.conn, issue_id)["source_quote"], quote)
+        self.assertEqual(transcripts.get_transcript(self.conn, tid)["raw_text"], raw)
+        self.assertEqual(len(db.list_issues(self.conn)), 1)
+        third = transcripts.reextract_apply(self.conn, tid)
+        self.assertEqual(third["added_count"], 0)
+        runs = self.conn.execute(
+            "SELECT extraction_method, added_count, skipped_count FROM extraction_runs WHERE transcript_id=? ORDER BY run_id",
+            (tid,)).fetchall()
+        self.assertEqual([tuple(r) for r in runs], [
+            ("rule:v2", 0, len(before_ids)),
+            ("rule:v2", 1, len(before_ids)),
+            ("rule:v2", 0, len(before_ids) + 1),
+        ])
+        draft_count = len(transcripts.list_drafts(self.conn, project_id=proj["project_id"], transcript_id=tid))
+        transcripts.reparse_apply(self.conn, tid)
+        self.assertEqual(len(transcripts.list_drafts(
+            self.conn, project_id=proj["project_id"], transcript_id=tid)), draft_count)
+
+    def test_legacy_quote_match_does_not_backfill_or_duplicate(self):
+        proj = self.project()
+        imported = self.import_example("meeting-colloquial.txt", proj["project_id"])
+        tid = imported["transcript_id"]
+        self.conn.execute("UPDATE drafts SET sentence_index='' WHERE transcript_id=?", (tid,))
+        self.conn.commit()
+        preview = transcripts.reextract_preview(self.conn, tid)
+        self.assertEqual(preview["added_count"], 0)
+        self.assertTrue(all(row["reason"] == "legacy_quote" for row in preview["skipped"]))
+        applied = transcripts.reextract_apply(self.conn, tid)
+        self.assertEqual(applied["added_count"], 0)
+        stored = transcripts.list_drafts(self.conn, project_id=proj["project_id"], transcript_id=tid)
+        self.assertTrue(all(d["sentence_index"] == "" for d in stored))
+        self.assertEqual(len(stored), len(imported["drafts"]))
+
+    def test_http_reextract_preview_does_not_apply_without_confirm(self):
+        http_dir = self.dir / "http"
+        http_dir.mkdir()
+        cfg = config.Config(operator="測試員", port=0, data_dir=http_dir)
+        srv = server.make_server(cfg, port=0)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            def req(method, path, body):
+                import http.client
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                data = json.dumps(body).encode("utf-8")
+                conn.request(method, path, body=data, headers={
+                    "Host": f"127.0.0.1:{port}",
+                    "X-SDT": "1",
+                    "Content-Type": "application/json",
+                })
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode("utf-8"))
+                status = response.status
+                conn.close()
+                return status, payload
+
+            status, proj = req("POST", "/api/projects", {"name": "合成專案甲"})
+            self.assertEqual(status, 201)
+            status, imported = req("POST", "/api/transcripts/import", {
+                "project_id": proj["project"]["project_id"],
+                "filename": "meeting-colloquial.txt",
+                "content_base64": b64((EXAMPLES / "meeting-colloquial.txt").read_bytes()),
+                "confirm": True,
+            })
+            self.assertEqual(status, 200)
+            tid = imported["transcript_id"]
+            status, preview = req("POST", f"/api/transcripts/{tid}/reextract/preview", {})
+            self.assertEqual(status, 200)
+            self.assertFalse(preview["applied"])
+            self.assertIn("尚未寫入", preview["message"])
+            status, denied = req("POST", f"/api/transcripts/{tid}/reextract", {})
+            self.assertEqual(status, 400)
+            self.assertTrue(any("預覽重新抽取" in err for err in denied["errors"]))
+            status, time_preview = req("POST", f"/api/transcripts/{tid}/reparse/preview", {})
+            self.assertEqual(status, 200)
+            self.assertNotIn("added_count", time_preview)
+        finally:
+            srv.shutdown()
+            srv.server_close()

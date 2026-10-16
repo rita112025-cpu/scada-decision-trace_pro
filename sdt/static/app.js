@@ -411,8 +411,10 @@ async function loadReparseTranscripts() {
   if (!projectId) return;
   const data = await api("/api/transcripts?" + new URLSearchParams({ project_id: projectId }));
   for (const item of data.items) {
-    if (item.format !== "txt") continue;
-    sel.append(new Option(`${item.transcript_id}　${item.filename}　${item.timestamp_status}`, item.transcript_id));
+    sel.append(new Option(
+      `${item.transcript_id}　${item.filename}　${item.format}　${item.timestamp_status}`,
+      item.transcript_id,
+    ));
   }
 }
 
@@ -423,6 +425,7 @@ async function openImport() {
   $("#import-errors").hidden = true;
   $("#import-preview").hidden = true;
   $("#reparse-preview").hidden = true;
+  $("#reextract-preview").hidden = true;
   $("#dlg-import").showModal();
   await loadReparseTranscripts();
 }
@@ -467,6 +470,51 @@ async function applyReparse() {
   showMsg(res.message);
   await previewReparse();
   await loadReparseTranscripts();
+}
+
+function selectedTranscriptId() {
+  const id = $("#reparse-transcript").value;
+  if (!id) {
+    const box = $("#import-errors");
+    box.textContent = "請選擇已匯入的逐字稿";
+    box.hidden = false;
+    return "";
+  }
+  return id;
+}
+
+async function previewReextract() {
+  const box = $("#import-errors");
+  box.hidden = true;
+  const id = selectedTranscriptId();
+  if (!id) return;
+  const res = await api(`/api/transcripts/${encodeURIComponent(id)}/reextract/preview`, { method: "POST", json: {} });
+  const lines = [
+    res.message,
+    `抽取版本：${res.extraction_method}`,
+    `將新增 ${res.added_count}、來源位置已存在而略過 ${res.skipped_count}、既有草稿保留 ${res.kept_count}`,
+    `先前抽取紀錄 ${res.runs.length} 筆。這是預覽，尚未寫入，也不會確認入帳。`,
+  ];
+  for (const row of res.added.slice(0, 12)) {
+    lines.push(`新增 ${row.kind} 規則 ${row.rule_id} 第 ${row.line || "—"} 行第 ${row.sentence_index} 句：${row.source_quote}`);
+  }
+  for (const row of res.skipped.slice(0, 8)) {
+    const why = row.reason === "legacy_quote" ? "舊草稿已依原文一對一對上" : "來源位置已有草稿";
+    lines.push(`略過 ${row.kind} 第 ${row.line || "—"} 行第 ${row.sentence_index} 句（${why}）`);
+  }
+  const pre = $("#reextract-preview");
+  pre.textContent = lines.join("\n");
+  pre.hidden = false;
+}
+
+async function applyReextract() {
+  const box = $("#import-errors");
+  box.hidden = true;
+  const id = selectedTranscriptId();
+  if (!id) return;
+  const res = await api(`/api/transcripts/${encodeURIComponent(id)}/reextract`, { method: "POST", json: { confirm: true } });
+  showMsg(res.message);
+  await previewReextract();
 }
 
 async function previewImport() {
@@ -543,6 +591,7 @@ function renderDraft(draft) {
   card.append(el("h3", `${draft.draft_id}　${draft.kind}　${draft.review_status}`));
   card.append(el("p", draft.location_label, "hint"));
   card.append(el("p", `時間：${draft.timestamp_label}`, "hint"));
+  card.append(el("p", `抽取 ${draft.extraction_method || "—"}　句子位置 ${draft.sentence_index || "（舊資料未記錄）"}`, "hint"));
   if (draft.rule_id || draft.reason) {
     card.append(el("p", `規則 ${draft.rule_id || "—"}：${draft.reason || ""}`, "hint"));
   }
@@ -714,6 +763,16 @@ async function init() {
     box.hidden = false;
   }));
   $("#btn-reparse-apply").addEventListener("click", () => applyReparse().catch((e) => {
+    const box = $("#import-errors");
+    box.textContent = e.message;
+    box.hidden = false;
+  }));
+  $("#btn-reextract-preview").addEventListener("click", () => previewReextract().catch((e) => {
+    const box = $("#import-errors");
+    box.textContent = e.message;
+    box.hidden = false;
+  }));
+  $("#btn-reextract-apply").addEventListener("click", () => applyReextract().catch((e) => {
     const box = $("#import-errors");
     box.textContent = e.message;
     box.hidden = false;

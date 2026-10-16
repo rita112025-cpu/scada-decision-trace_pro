@@ -246,7 +246,7 @@ cd C:\path\to\scada-decision-trace_pro
 py -3 -m sdt serve
 ```
 
-把要檢查的 UTF-8 TXT 放在驗收目錄第一層。對得上逐字稿的項目才寫進 `annotation.json`（欄位見 `examples/synthetic/annotation-template.json`，也可改用 `annotation.csv`，欄位 `kind,line,segment_id,note`）。對不到的放 `pending.json`。你自己判定的誤收放 `false-positives.json`。然後：
+把要檢查的 UTF-8 TXT 放在驗收目錄第一層。對得上逐字稿的項目才寫進 `annotation.json`（欄位見 `examples/synthetic/annotation-template.json`，也可改用 `annotation.csv`）。每一筆答案都要有 `file`、`line`、`sentence`：`sentence` 是該行由 1 起算的句序。只填行號不夠；跨檔案同一行、同一行多句、重複標註，或對不到唯一一句時，整份 precision／recall 會拒絕計算，那些筆不會算成命中。對不到的放 `pending.json`，不進入分母。你自己判定的誤收放 `false-positives.json`。然後：
 
 ```powershell
 cd C:\path\to\scada-decision-trace_pro
@@ -259,4 +259,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\verify_local.ps1
 py -3 scripts\verify_local.py --dir C:\Users\user\sdt-verify
 ```
 
-沒有標註檔時，報告只給候選數、時間分段數，以及你若已填寫的誤收與待確認；不計算 precision／recall，也不聲稱召回率。有標註之後，才會分別列出決議與待辦的 precision、recall，並寫明分子、分母和樣本是哪些 TXT。`examples/synthetic/` 裡的句子是另行編造的，不是從真實會議改寫。
+終端只顯示狀態碼與彙總數字（檔案數、候選數、決議數、待辦數、標註數、待確認數、誤收數、是否完成評分、拒絕筆數）。完整報告、候選原文、人工備註、檔名與路徑只寫進該目錄的 `reports\verify-report.txt`，不會印到終端。錯誤同樣只給狀態碼與固定錯誤代碼。
+
+沒有標註檔時，報告只給候選數、時間分段數，以及你若已填寫的誤收與待確認；不計算 precision／recall，也不聲稱召回率。標註都能唯一定位、且預測與答案可以一對一配對時，才會分別列出決議與待辦的 precision、recall，並寫明分子、分母和樣本是哪些 TXT。配對鍵是種類、檔名、行號與句序。
+
+已匯入的逐字稿可以分開做兩件事：重新解析時間，以及依目前規則重新抽取候選。兩者都先預覽。重新抽取只補上來源位置還沒有的草稿，不覆寫既有摘要、原文、審核狀態或已入帳事項，也不會自動確認入帳。相同句子若出現在不同段落，會各自保留。抽取版本與新增、略過筆數寫在抽取紀錄。
+
+`examples/synthetic/` 裡的句子是另行編造的，不是從真實會議改寫。

@@ -238,6 +238,15 @@ def make_handler(app):
                     raise db.ValidationError(["請先預覽重新解析，確認後再套用"])
                 with app.lock, app.conn() as conn:
                     return self._json(200, transcripts.reparse_apply(conn, parts[1]))
+            if route == ("POST", "transcripts") and parts[1:2] != ["preview"] and parts[2:] == ["reextract", "preview"]:
+                with app.conn() as conn:
+                    return self._json(200, transcripts.reextract_preview(conn, parts[1]))
+            if route == ("POST", "transcripts") and parts[2:] == ["reextract"]:
+                data = self._json_body()
+                if data.get("confirm") is not True:
+                    raise db.ValidationError(["請先預覽重新抽取，確認後再套用。套用不會自動入帳"])
+                with app.lock, app.conn() as conn:
+                    return self._json(200, transcripts.reextract_apply(conn, parts[1]))
             if route == ("GET", "transcripts") and len(parts) == 1:
                 with app.conn() as conn:
                     return self._json(200, {"items": transcripts.list_transcripts(conn, query.get("project_id", ""))})

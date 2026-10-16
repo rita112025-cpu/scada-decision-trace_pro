@@ -1,8 +1,8 @@
 {
-  "description": "虛構標註模板。只有你在本機把參考項目對回逐字稿原文之後，才把 kind 與 line 寫進自己的標註檔。對不到的項目不要放進 items，改放 pending.json，狀態視為待確認。本檔不是真實會議，也不能當成真實資料的答案。",
+  "description": "虛構標註模板。每一筆答案都要有 file、line、sentence。sentence 是該行由 1 起算的句序，以句號、驚嘆號、問號切開。只填行號無法唯一對應：跨檔案同一行、同一行多句、重複標註，或句子位置對不到唯一一句時，整份 precision／recall 會拒絕計算，那些筆不會算成命中，也不會在只有一句時自動補上句序。對不到的項目不要放進 items，改放 pending.json，狀態視為待確認，且不進入分母。本檔不是真實會議，也不能當成真實資料的答案。",
   "items": [
-    {"kind": "決議", "line": 11, "note": "虛構：這一行寫明本次決議"},
-    {"kind": "待辦", "line": 12, "note": "虛構：這一行是待辦，但沒有負責人與期限"},
-    {"kind": "待辦", "line": 13, "note": "虛構：這一行同時寫明負責人與期限"}
+    {"kind": "決議", "file": "meeting-colloquial.txt", "line": 11, "sentence": 1, "note": "虛構：這一行第 1 句寫明本次決議"},
+    {"kind": "待辦", "file": "meeting-colloquial.txt", "line": 12, "sentence": 1, "note": "虛構：這一行第 1 句是待辦，但沒有負責人與期限"},
+    {"kind": "待辦", "file": "meeting-colloquial.txt", "line": 13, "sentence": 1, "note": "虛構：這一行第 1 句同時寫明負責人與期限"}
   ]
 }

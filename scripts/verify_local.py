@@ -1,10 +1,12 @@
 """本機驗收：只讀使用者指定目錄裡的 TXT，在記憶體裡產生候選，報告寫回該目錄。
 
 不連外網、不呼叫模型、不確認入帳、不改寫原始檔。
+終端只印狀態碼與彙總數字。完整報告、候選原文、人工備註、檔名與路徑只留在報告檔。
 預設目錄是 C:\\Users\\user\\sdt-verify。雲端代理不應拿這個腳本去讀真實會議。
 """
 import argparse
 import csv
+import io
 import json
 import os
 import pathlib
@@ -14,50 +16,107 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sdt import transcripts  # noqa: E402
-from sdt.db import ValidationError  # noqa: E402
+from sdt import db, transcripts  # noqa: E402
 
 DEFAULT_DIR = pathlib.Path(r"C:\Users\user\sdt-verify")
 DOCX_NAME = "SCADA會議紀錄.docx"
 
+_PROBLEM_TEXT = {
+    "missing_file": "缺少檔案識別，不能只靠行號評分",
+    "missing_line": "缺少行號",
+    "missing_sentence": "缺少句子位置。同一行可能有多句，不能把整行算成命中",
+    "duplicate": "同一檔案、同一行、同一句、同一類型重複標註",
+    "not_found": "找不到這個檔案或行，或句子位置超出該行句數",
+    "ambiguous_line": "這個行號在檔案裡對到不只一個段落，無法唯一定位",
+    "duplicate_prediction": "預測在同一檔案、同一行、同一句、同一類型出現超過一次，無法一對一配對",
+}
+
+
+class VerifyProblem(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+class QuietParser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write("status=2\nerror=failed\n")
+        raise SystemExit(2)
+
 
 def read_only_text(path):
-    before = path.stat()
-    fd = os.open(path, os.O_RDONLY)
+    try:
+        before = path.stat()
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        raise VerifyProblem("failed")
     try:
         with os.fdopen(fd, "r", encoding="utf-8") as handle:
             text = handle.read()
-    except UnicodeDecodeError as exc:
-        raise ValidationError([f"{path.name} 不是 UTF-8"]) from exc
-    after = path.stat()
+    except UnicodeDecodeError:
+        raise VerifyProblem("not_utf8")
+    except VerifyProblem:
+        raise
+    except Exception:
+        raise VerifyProblem("failed")
+    try:
+        after = path.stat()
+    except OSError:
+        raise VerifyProblem("failed")
     if (before.st_mtime_ns, before.st_size) != (after.st_mtime_ns, after.st_size):
-        raise ValidationError([f"讀取期間 {path.name} 的大小或時間變了，已停止"])
+        raise VerifyProblem("source_changed")
+    if text.startswith("\ufeff"):
+        text = text[1:]
     return text
 
 
+def _index(value):
+    if isinstance(value, bool) or isinstance(value, float):
+        raise VerifyProblem("bad_annotation")
+    if value in ("", None):
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    text = str(value).strip()
+    if not text:
+        return ""
+    if not text.isdigit():
+        raise VerifyProblem("bad_annotation")
+    return str(int(text))
+
+
 def _load_json(path):
-    return json.loads(read_only_text(path))
+    try:
+        data = json.loads(read_only_text(path))
+    except VerifyProblem:
+        raise
+    except json.JSONDecodeError:
+        raise VerifyProblem("bad_annotation")
+    except Exception:
+        raise VerifyProblem("bad_annotation")
+    return data
 
 
 def _as_items(data):
     if isinstance(data, dict):
         data = data.get("items", [])
     if not isinstance(data, list):
-        raise ValidationError(["標註檔的 items 必須是陣列"])
+        raise VerifyProblem("bad_annotation")
     items = []
     for row in data:
         if not isinstance(row, dict):
-            continue
+            raise VerifyProblem("bad_annotation")
         kind = str(row.get("kind") or "").strip()
         if kind not in {"決議", "待辦"}:
             continue
-        line = row.get("line", "")
-        segment_id = str(row.get("segment_id") or "").strip()
-        note = str(row.get("note") or "")
-        line_no = ""
-        if line not in ("", None):
-            line_no = str(int(line))
-        items.append({"kind": kind, "line": line_no, "segment_id": segment_id, "note": note})
+        items.append({
+            "kind": kind,
+            "file": str(row.get("file") or "").strip(),
+            "line": _index(row.get("line", "")),
+            "sentence": _index(row.get("sentence", "")),
+            "segment_id": str(row.get("segment_id") or "").strip(),
+            "note": str(row.get("note") or ""),
+        })
     return items
 
 
@@ -66,19 +125,26 @@ def load_table(path):
         return []
     if path.suffix.lower() == ".json":
         return _as_items(_load_json(path))
-    fd = os.open(path, os.O_RDONLY)
-    with os.fdopen(fd, "r", encoding="utf-8-sig", newline="") as handle:
-        rows = list(csv.DictReader(handle))
+    try:
+        rows = list(csv.DictReader(io.StringIO(read_only_text(path))))
+    except VerifyProblem:
+        raise
+    except csv.Error:
+        raise VerifyProblem("bad_annotation")
+    except Exception:
+        raise VerifyProblem("bad_annotation")
     return _as_items(rows)
 
 
-def candidate_rows(parsed):
+def candidate_rows(parsed, filename):
     rows = []
     for cand in transcripts.extract_candidates(parsed["segments"]):
         seg = next(s for s in parsed["segments"] if s["source_segment_id"] == cand["segment_key"])
         rows.append({
             "kind": cand["kind"],
+            "file": filename,
             "line": str(seg["line_start"] or ""),
+            "sentence": str(cand["sentence_index"]),
             "segment_id": seg["source_segment_id"],
             "rule_id": cand["rule_id"],
             "quote": cand["source_quote"],
@@ -88,44 +154,130 @@ def candidate_rows(parsed):
     return rows
 
 
-def _key(item):
-    if item.get("line"):
-        return ("line", str(item["line"]))
-    if item.get("segment_id"):
-        return ("segment", str(item["segment_id"]))
-    return None
+def line_map(parsed):
+    lines = {}
+    for seg in parsed["segments"]:
+        line = str(seg["line_start"] or "")
+        count = len(transcripts._sentences(seg.get("text") or ""))
+        if line in lines:
+            lines[line] = None
+        else:
+            lines[line] = count
+    return lines
 
 
-def score_kind(kind, gold, predicted):
-    gold_k = [g for g in gold if g["kind"] == kind and _key(g)]
-    pred_k = [p for p in predicted if p["kind"] == kind]
-    gold_keys = {_key(g) for g in gold_k}
-    pred_keys = [_key(p) for p in pred_k]
-    matched_pred = sum(1 for key in pred_keys if key in gold_keys)
-    matched_gold = len(gold_keys & set(pred_keys))
+def _location_problem(item, locations):
+    if not item.get("file"):
+        return "missing_file"
+    if not item.get("line"):
+        return "missing_line"
+    if not item.get("sentence"):
+        return "missing_sentence"
+    found = locations.get(item["file"])
+    if found is None or item["line"] not in found:
+        return "not_found"
+    count = found[item["line"]]
+    if count is None:
+        return "ambiguous_line"
+    sent = int(item["sentence"])
+    if sent < 1 or sent > count:
+        return "not_found"
+    return ""
+
+
+def _pair_key(item):
+    return (item["kind"], item["file"], item["line"], item["sentence"])
+
+
+def evaluate_score(gold, predicted, locations):
+    """預測與答案以種類、檔名、行號、句序一對一配對。
+
+    任一答案無法唯一定位，或任一側的鍵重複，就整份拒絕評分，不把那些筆算成命中。
+    """
+    if not gold:
+        return {
+            "ok": False,
+            "empty": True,
+            "refused": 0,
+            "problems": [],
+            "matched_total": 0,
+            "by_kind": None,
+        }
+    problems = []
+    groups = {}
+    for index, item in enumerate(gold, start=1):
+        code = _location_problem(item, locations)
+        if code:
+            problems.append({"code": code, "index": index})
+            continue
+        groups.setdefault(_pair_key(item), []).append(index)
+    for indexes in groups.values():
+        if len(indexes) > 1:
+            for index in indexes:
+                problems.append({"code": "duplicate", "index": index})
+    pred_groups = {}
+    for item in predicted:
+        if _location_problem(item, locations):
+            problems.append({"code": "not_found", "index": 0})
+            continue
+        key = _pair_key(item)
+        pred_groups[key] = pred_groups.get(key, 0) + 1
+    for count in pred_groups.values():
+        if count > 1:
+            problems.append({"code": "duplicate_prediction", "index": 0, "count": count})
+    if problems:
+        return {
+            "ok": False,
+            "empty": False,
+            "refused": len(problems),
+            "problems": problems,
+            "matched_total": 0,
+            "by_kind": None,
+        }
+    by_kind = {}
+    matched_total = 0
+    for kind in ("決議", "待辦"):
+        gold_keys = [key for key in groups if key[0] == kind]
+        pred_keys = [key for key in pred_groups if key[0] == kind]
+        matched = len(set(gold_keys) & set(pred_keys))
+        matched_total += matched
+        by_kind[kind] = {
+            "matched": matched,
+            "predictions": len(pred_keys),
+            "gold": len(gold_keys),
+            "precision": f"{matched}/{len(pred_keys)}" if pred_keys else "無候選（分母 0）",
+            "recall": f"{matched}/{len(gold_keys)}" if gold_keys else "無標註（分母 0）",
+        }
     return {
-        "kind": kind,
-        "matched_predictions": matched_pred,
-        "predictions": len(pred_k),
-        "matched_gold": matched_gold,
-        "gold": len(gold_k),
-        "precision": f"{matched_pred}/{len(pred_k)}" if pred_k else "無候選（分母 0）",
-        "recall": f"{matched_gold}/{len(gold_k)}" if gold_k else "無標註（分母 0）",
+        "ok": True,
+        "empty": False,
+        "refused": 0,
+        "problems": [],
+        "matched_total": matched_total,
+        "by_kind": by_kind,
     }
 
 
 def analyze_file(path):
     text = read_only_text(path).replace("\r\n", "\n").replace("\r", "\n")
-    parsed = transcripts.parse_upload(path.name, text)
+    try:
+        parsed = transcripts.parse_upload(path.name, text)
+    except db.ValidationError:
+        raise VerifyProblem("failed")
+    except VerifyProblem:
+        raise
+    except Exception:
+        raise VerifyProblem("failed")
     return {
         "filename": path.name,
         "time_counts": parsed.get("time_counts") or {},
         "timestamp_status": parsed.get("timestamp_status", ""),
-        "candidates": candidate_rows(parsed),
+        "candidates": candidate_rows(parsed, path.name),
+        "lines": line_map(parsed),
     }
 
 
-def build_report(directory, analyses, gold, pending, false_hits, docx_present):
+def build_report(directory, analyses, gold, pending, false_hits, docx_present, score):
     lines = [
         "本機驗收報告",
         f"目錄：{directory}",
@@ -157,15 +309,15 @@ def build_report(directory, analyses, gold, pending, false_hits, docx_present):
         )
         for cand in item["candidates"]:
             total[cand["kind"]] = total.get(cand["kind"], 0) + 1
-            predicted.append(dict(cand, filename=item["filename"]))
+            predicted.append(cand)
             lines.append(
-                f"  候選 {cand['kind']} 規則 {cand['rule_id']} 第 {cand['line']} 行："
-                f"{cand['quote']}"
+                f"  候選 {cand['kind']} 規則 {cand['rule_id']} "
+                f"第 {cand['line']} 行第 {cand['sentence']} 句：{cand['quote']}"
             )
     lines.append("")
     lines.append(f"候選數：決議 {total.get('決議', 0)}、待辦 {total.get('待辦', 0)}。")
     if pending:
-        lines.append("待確認（尚未對到逐字稿行號或段落，不進入召回率分母）：")
+        lines.append("待確認（不進入召回率分母，也不會因為缺少位置而拒絕整份評分）：")
         for row in pending:
             lines.append(f"  {row['kind']}：{row['note'] or '（沒有備註）'}")
     else:
@@ -177,31 +329,54 @@ def build_report(directory, analyses, gold, pending, false_hits, docx_present):
             lines.append(f"  {row['kind']} {where}：{row['note'] or '（沒有備註）'}")
     else:
         lines.append("尚未提供 false-positives.json。誤收案例要人工記入該檔，本報告不自動判斷哪一筆是誤收。")
-    anchored = [g for g in gold if _key(g)]
-    if not anchored:
-        lines.append("")
-        lines.append("未建立可對到行號或段落 ID 的標註答案。此處不計算 precision 或 recall，也不聲稱召回率。")
+    lines.append("")
+    if score["empty"]:
+        lines.append("未建立可評分的標註答案。此處不計算 precision 或 recall，也不聲稱召回率。")
+        lines.append("標註必須同時有 file、line、sentence。sentence 是該行由 1 起算的句序。只填行號不夠。")
+    elif not score["ok"]:
+        lines.append(
+            "拒絕評分。下列標註無法唯一定位，或預測無法一對一配對。"
+            "這些項目沒有算成命中，因此不計算 precision 或 recall。"
+        )
+        for problem in score["problems"]:
+            label = _PROBLEM_TEXT.get(problem["code"], problem["code"])
+            if problem.get("index"):
+                item = gold[problem["index"] - 1]
+                lines.append(
+                    f"  標註第 {problem['index']} 筆（{item['kind']}，"
+                    f"檔案 {item['file'] or '（空）'}，行 {item['line'] or '（空）'}，"
+                    f"句 {item['sentence'] or '（空）'}）：{label}。"
+                )
+            else:
+                lines.append(f"  預測：{label}。")
+        lines.append("請修正標註或候選位置後再評分。在此之前，任何一筆都不會被算成命中。")
     else:
-        lines.append("")
-        lines.append(f"標註答案 {len(anchored)} 筆（只含已填行號或段落 ID 的項目）。樣本是上面列出的 TXT。")
+        lines.append(
+            f"標註答案 {len(gold)} 筆。每一筆都有檔名、行號與句序，且沒有重複。"
+            "樣本是上面列出的 TXT。配對是一對一，跨檔案不會因為行號相同而對上。"
+        )
         for kind in ("決議", "待辦"):
-            scored = score_kind(kind, anchored, predicted)
+            scored = score["by_kind"][kind]
             lines.append(
-                f"{kind} precision {scored['precision']}（分子是預測裡對到標註的筆數，分母是該類候選數）；"
-                f" recall {scored['recall']}（分子是標註裡至少被一筆候選對到的筆數，分母是該類已對到行號的標註數）。"
+                f"{kind} precision {scored['precision']}（分子是與標註一對一對上的候選數，分母是該類候選數）；"
+                f" recall {scored['recall']}（分子是與候選一對一對上的標註數，分母是該類已能唯一定位的標註數）。"
             )
         lines.append("對不到逐字稿的參考項目若放在 pending.json，沒有算進分母。")
     lines.append("")
     lines.append("未驗證：本腳本沒有打開瀏覽器、沒有讀取參考 docx 內文、沒有把候選寫進事項台帳。")
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", predicted
 
 
 def verify(directory):
     directory = pathlib.Path(directory)
     if not directory.is_dir():
-        raise ValidationError([f"找不到驗收目錄：{directory}"])
+        raise VerifyProblem("missing_dir")
     analyses = []
-    for path in sorted(directory.glob("*.txt")):
+    try:
+        names = sorted(directory.glob("*.txt"))
+    except OSError:
+        raise VerifyProblem("failed")
+    for path in names:
         if not path.is_file():
             continue
         analyses.append(analyze_file(path))
@@ -211,25 +386,63 @@ def verify(directory):
     pending = load_table(directory / "pending.json")
     false_hits = load_table(directory / "false-positives.json")
     docx_present = (directory / DOCX_NAME).is_file()
-    report = build_report(directory, analyses, gold, pending, false_hits, docx_present)
-    out_dir = directory / "reports"
-    out_dir.mkdir(exist_ok=True)
-    out = out_dir / "verify-report.txt"
-    out.write_text(report, encoding="utf-8")
-    return {"report_path": str(out), "text": report, "files": len(analyses)}
+    locations = {item["filename"]: item["lines"] for item in analyses}
+    predicted = [cand for item in analyses for cand in item["candidates"]]
+    score = evaluate_score(gold, predicted, locations)
+    report, _ = build_report(directory, analyses, gold, pending, false_hits, docx_present, score)
+    try:
+        out_dir = directory / "reports"
+        out_dir.mkdir(exist_ok=True)
+        out = out_dir / "verify-report.txt"
+        out.write_text(report, encoding="utf-8")
+    except OSError:
+        raise VerifyProblem("failed")
+    decisions = sum(1 for cand in predicted if cand["kind"] == "決議")
+    todos = sum(1 for cand in predicted if cand["kind"] == "待辦")
+    return {
+        "report_path": str(out),
+        "text": report,
+        "files": len(analyses),
+        "candidates": len(predicted),
+        "decisions": decisions,
+        "todos": todos,
+        "gold": len(gold),
+        "pending": len(pending),
+        "false_hits": len(false_hits),
+        "scored": 1 if score["ok"] else 0,
+        "refused": score["refused"],
+        "score": score,
+    }
+
+
+def _counts(result):
+    return "\n".join([
+        "status=0",
+        f"files={result['files']}",
+        f"candidates={result['candidates']}",
+        f"decisions={result['decisions']}",
+        f"todos={result['todos']}",
+        f"gold={result['gold']}",
+        f"pending={result['pending']}",
+        f"false_hits={result['false_hits']}",
+        f"scored={result['scored']}",
+        f"refused={result['refused']}",
+    ])
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="在本機目錄驗收虛構或使用者自己的 TXT，不連外網。")
-    parser.add_argument("--dir", default=os.environ.get("SDT_VERIFY_DIR", str(DEFAULT_DIR)))
+    parser = QuietParser(description="在本機目錄驗收 TXT。終端只顯示狀態與彙總數字，詳細報告寫在目錄裡。")
+    parser.add_argument("--dir", default=os.environ.get("SDT_VERIFY_DIR") or str(DEFAULT_DIR), help="驗收目錄")
     args = parser.parse_args(argv)
     try:
         result = verify(args.dir)
-    except ValidationError as exc:
-        print("\n".join(exc.errors), file=sys.stderr)
+    except VerifyProblem as exc:
+        sys.stderr.write(f"status=2\nerror={exc.code}\n")
         return 2
-    print(result["text"])
-    print(f"報告已寫入 {result['report_path']}")
+    except Exception:
+        sys.stderr.write("status=2\nerror=failed\n")
+        return 2
+    sys.stdout.write(_counts(result) + "\n")
     return 0
 
 

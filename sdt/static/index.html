@@ -120,14 +120,27 @@
   </div>
   <pre id="import-preview" class="quote" hidden></pre>
   <section>
-    <h3>重新解析已匯入的 TXT 時間</h3>
-    <p class="hint">只更新對得上的行的時間與抽取用正文。原始行、草稿審核狀態、已入帳事項與原始引用都保留。不會因為重新解析而自動入帳。</p>
+    <h3>已匯入的逐字稿</h3>
+    <p class="hint">重新解析時間與重新抽取候選是兩個動作，各自預覽、各自套用。都不會自動確認入帳。</p>
+    <select id="reparse-transcript"></select>
+  </section>
+  <section>
+    <h3>重新解析時間</h3>
+    <p class="hint">只更新對得上的行的時間與抽取用正文。原始行、草稿審核狀態、已入帳事項與原始引用都保留。不會產生新草稿。</p>
     <div class="filters">
-      <select id="reparse-transcript"></select>
       <button type="button" id="btn-reparse-preview">預覽重新解析</button>
       <button type="button" id="btn-reparse-apply">套用重新解析</button>
     </div>
     <pre id="reparse-preview" class="quote" hidden></pre>
+  </section>
+  <section>
+    <h3>重新抽取候選</h3>
+    <p class="hint">依目前規則預覽會新增的候選。套用時只補來源位置還沒有的草稿，不覆寫既有摘要、原文、審核狀態或已入帳事項。相同句子在不同段落會各自保留。</p>
+    <div class="filters">
+      <button type="button" id="btn-reextract-preview">預覽重新抽取</button>
+      <button type="button" id="btn-reextract-apply">套用重新抽取</button>
+    </div>
+    <pre id="reextract-preview" class="quote" hidden></pre>
   </section>
   <div id="import-errors" class="msg error" hidden></div>
   <div class="dlg-actions">
