@@ -2,7 +2,14 @@
 data/
 config.json
 *.db
+*.db-wal
+*.db-shm
 *.csv
 *.md.bak
 __pycache__/
 *.pyc
+# 本機真實驗收目錄與報告，即使被複製進工作區也不進版控
+sdt-verify/
+verify-reports/
+# 本機口語說法清單可能含真實講法，不進版控
+cues.json

@@ -1,10 +1,12 @@
 """資料層、CSV、議程、備份的自動化測試（只用標準函式庫 unittest）。"""
+import json
 import pathlib
 import sqlite3
 import tempfile
+import threading
 import unittest
 
-from sdt import agenda, backup, csvio, db, sample
+from sdt import agenda, backup, config, csvio, db, sample
 
 TODAY = "2026-10-14"
 
@@ -198,6 +200,24 @@ class TestCsv(Base):
         with self.assertRaises(db.ValidationError):
             csvio.import_issues(self.conn, "標題,奇怪欄位\r\nx,y\r\n".encode("utf-8"), "u")
 
+    def test_bad_created_at_rejects_whole_import(self):
+        data = "標題,建立時間\r\n好的一列,2026-10-16 09:30:00\r\n壞的一列,不是日期\r\n".encode("utf-8-sig")
+        with self.assertRaises(db.ValidationError) as cm:
+            csvio.import_issues(self.conn, data, "u")
+        self.assertIn("第 3 列", cm.exception.errors[0])
+        self.assertIn("建立時間", cm.exception.errors[0])
+        self.assertEqual(db.list_issues(self.conn), [])
+
+    def test_created_at_is_normalized_before_write(self):
+        data = "標題,建立時間\r\n虛構事項,2026/3/5 8:09\r\n".encode("utf-8-sig")
+        result = csvio.import_issues(self.conn, data, "u")
+        self.assertEqual(result["created"], 1)
+        self.assertEqual(db.list_issues(self.conn)[0]["created_at"], "2026-03-05 08:09:00")
+        bad_day = "標題,建立時間\r\n另一筆,2026-02-31\r\n".encode("utf-8-sig")
+        with self.assertRaises(db.ValidationError):
+            csvio.import_issues(self.conn, bad_day, "u")
+        self.assertEqual(len(db.list_issues(self.conn)), 1)
+
 
 class TestAgenda(Base):
     def test_sections_and_no_inferred_decisions(self):
@@ -261,6 +281,97 @@ class TestSampleAndBackup(Base):
         bogus.write_bytes(b"not a database at all" * 100)
         with self.assertRaises(ValueError):
             backup.restore(self.db_path, bogus, self.dir / "backups")
+
+
+class TestIdsAndConnections(Base):
+    def test_next_public_id_uses_max_and_keeps_width(self):
+        self.conn.execute(
+            "INSERT INTO projects(project_id, name, created_at) VALUES (?,?,?)",
+            ("PRJ-0002", "虛構甲", "2026-10-16 00:00:00"))
+        self.conn.execute(
+            "INSERT INTO projects(project_id, name, created_at) VALUES (?,?,?)",
+            ("PRJ-0009", "虛構乙", "2026-10-16 00:00:00"))
+        self.conn.execute(
+            "INSERT INTO projects(project_id, name, created_at) VALUES (?,?,?)",
+            ("PRJ-note", "虛構丙", "2026-10-16 00:00:00"))
+        self.conn.commit()
+        self.assertEqual(db.next_public_id(self.conn, "projects", "project_id", "PRJ-"), "PRJ-0010")
+        self.assertEqual(db.next_public_id(self.conn, "drafts", "draft_id", "DR-"), "DR-0001")
+
+    def test_wal_and_migrate_once(self):
+        mode = self.conn.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertEqual(mode, "wal")
+        self.assertGreaterEqual(self.conn.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+        path = self.dir / "once.db"
+        calls = {"n": 0}
+        real = db.migrate
+
+        def wrapped(conn):
+            calls["n"] += 1
+            return real(conn)
+
+        db.migrate = wrapped
+        try:
+            db.connect(path).close()
+            db.connect(path).close()
+        finally:
+            db.migrate = real
+        self.assertEqual(calls["n"], 1)
+        again = db.connect(path)
+        self.assertEqual(again.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        again.close()
+
+    def test_concurrent_sessions_do_not_lock(self):
+        path = self.dir / "concurrent.db"
+        with db.session(path) as conn:
+            project = db.create_project(conn, "虛構並行專案")
+            pid = project["project_id"]
+        errors = []
+
+        def worker(index):
+            try:
+                for n in range(6):
+                    with db.session(path) as conn:
+                        if n % 2 == 0:
+                            db.create_issue(conn, {
+                                "title": f"虛構並行事項 {index}-{n}",
+                                "project_id": pid,
+                                "issue_id": f"SDT-{index:02d}{n:02d}",
+                            }, "u")
+                        else:
+                            db.list_issues(conn)
+            except sqlite3.OperationalError as exc:
+                errors.append(str(exc))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        with db.session(path) as conn:
+            self.assertEqual(len(db.list_issues(conn)), 18)
+
+
+class TestConfig(Base):
+    def test_invalid_port_does_not_echo_path(self):
+        secret = self.dir / "secret-ledger-path"
+        secret.mkdir()
+        cfg_path = secret / "config.json"
+        for port in ("not-a-port", 0, 70000, 1.5, True, r"C:\Users\secret-ledger\hidden"):
+            cfg_path.write_text(json.dumps({"port": port, "data_dir": "data"}), encoding="utf-8")
+            with self.assertRaises(config.ConfigError) as cm:
+                config.load(cfg_path)
+            message = str(cm.exception)
+            self.assertIn("連接埠", message)
+            self.assertNotIn("secret-ledger-path", message)
+            self.assertNotIn(str(secret), message)
+            self.assertNotIn("hidden", message)
+        cfg_path.write_text('{"port": 8765, "note": "' + str(secret) + '"', encoding="utf-8")
+        with self.assertRaises(config.ConfigError) as cm:
+            config.load(cfg_path)
+        self.assertNotIn(str(secret), str(cm.exception))
+        self.assertNotIn("secret-ledger-path", str(cm.exception))
 
 
 if __name__ == "__main__":
