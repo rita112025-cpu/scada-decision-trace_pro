@@ -2,7 +2,12 @@
 // 所有資料一律用 textContent 寫入 DOM，避免把事項內容當 HTML 執行。
 
 const $ = (sel) => document.querySelector(sel);
-const VIEW_LABELS = { all: "全部", open: "未結事項", overdue: "逾期事項", disputed: "待確認／有爭議", accepted: "已驗收" };
+const VIEW_LABELS = { all: "全部", open: "未結", overdue: "逾期", disputed: "待確認／有爭議", accepted: "已驗收" };
+const THEME_KEY = "sdt-theme";
+const LAYOUT_KEY = "sdt-layout";
+const SECTION_KEY = "sdt-sidebar-sections";
+const ICONS_KEY = "sdt-sidebar-icons";
+const SECTION_DEFAULTS = { view: true, project: false, status: false, priority: false, source: false };
 const TEXTAREAS = new Set(["description", "source_excerpt", "acceptance_criteria"]);
 const ACTION_LABELS = {
   create: "新增", update: "修改", import: "匯入", sample: "範例", "clear-sample": "清除範例",
@@ -10,7 +15,11 @@ const ACTION_LABELS = {
 };
 
 let META = null;
-let state = { view: "open", editing: null, editingIssue: null, projects: [], importFile: null };
+let state = {
+  view: "all", editing: null, editingIssue: null, projects: [], importFile: null,
+  layout: "board", expanded: null, selected: null, items: [], facetItems: [], counts: {},
+  history: [], historyFor: null, sections: null, sidebarIcons: false,
+};
 
 async function api(path, opts = {}) {
   const headers = { "X-SDT": "1", ...(opts.headers || {}) };
@@ -73,51 +82,566 @@ function fillProjectSelect(sel, { includeNew = false, selected = "" } = {}) {
   else if (!sel.options.length && includeNew) sel.value = "__new__";
 }
 
-async function refresh() {
-  const [data, projects] = await Promise.all([api("/api/issues?" + query()), api("/api/projects")]);
-  state.projects = projects.items;
-  fillProjectFilter();
-  renderTabs(data.counts);
-  renderRows(data.items);
-  $("#btn-sample-clear").hidden = !data.has_sample;
-  $("#btn-sample-load").hidden = data.has_sample;
+function dueLabel(issue) {
+  if (!issue.due_date) return "—";
+  return issue.due_date.slice(5).replace("-", "/") + (issue.overdue ? " 逾期" : "");
 }
 
-function renderTabs(counts) {
-  const tabs = $("#tabs");
-  tabs.replaceChildren();
-  for (const v of META.views) {
-    const b = el("button", `${VIEW_LABELS[v]}（${counts[v]}）`);
-    b.setAttribute("aria-pressed", String(v === state.view));
-    b.addEventListener("click", () => { state.view = v; refresh().catch((e) => showMsg(e.message, "error")); });
-    tabs.append(b);
+function drawingLabel(issue) {
+  return [issue.drawing_no, issue.drawing_rev].filter(Boolean).join(" ") || "—";
+}
+
+function modelLabel(issue) {
+  return [issue.model_file, issue.model_element_id].filter(Boolean).join(" / ") || "—";
+}
+
+function tally(items, key) {
+  const counts = new Map();
+  for (const it of items) counts.set(it[key] || "", (counts.get(it[key] || "") || 0) + 1);
+  return counts;
+}
+
+function setSelect(id, value, toggle) {
+  const sel = $("#f-" + id);
+  const next = toggle && sel.value === value ? "" : value;
+  if (sel.value === next) return;
+  sel.value = next;
+  sel.dispatchEvent(new Event("change"));
+}
+
+function applyTheme(theme) {
+  const dark = theme !== "light";
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  const btn = $("#btn-theme");
+  btn.textContent = dark ? "☀ 切換為淺粉" : "☾ 切換為暗粉";
+  btn.setAttribute("aria-pressed", dark ? "true" : "false");
+  try { localStorage.setItem(THEME_KEY, dark ? "dark" : "light"); } catch (e) { /* 隱私模式仍可切換，只是不記住 */ }
+}
+
+function applyStoredTheme() {
+  let theme = "dark";
+  try { theme = localStorage.getItem(THEME_KEY) || "dark"; } catch (e) { theme = "dark"; }
+  applyTheme(theme === "light" ? "light" : "dark");
+}
+
+function applyLayout(layout) {
+  if (layout !== "board" && layout !== "split" && layout !== "segment") layout = "board";
+  state.layout = layout;
+  document.body.dataset.layout = layout;
+  try { localStorage.setItem(LAYOUT_KEY, layout); } catch (e) { /* 同上 */ }
+  $("#view-board").hidden = layout !== "board";
+  $("#view-split").hidden = layout !== "split";
+  $("#view-segment").hidden = layout !== "segment";
+  $("#view-segments").hidden = layout !== "segment";
+  const slot = layout === "segment" ? $("#search-slot-top") : $("#search-slot-side");
+  slot.append($("#f-q"));
+  for (const id of ["layout-board", "layout-split", "layout-segment"]) {
+    const button = $("#" + id);
+    button.setAttribute("aria-selected", button.dataset.layout === layout ? "true" : "false");
+  }
+  if (layout === "split" && !state.selected && state.items[0]) state.selected = state.items[0].issue_id;
+}
+
+function applyStoredLayout() {
+  let layout = "board";
+  try {
+    const saved = localStorage.getItem(LAYOUT_KEY);
+    if (saved === "split" || saved === "segment" || saved === "board") layout = saved;
+  } catch (e) { layout = "board"; }
+  applyLayout(layout);
+  if (window.matchMedia("(max-width: 860px)").matches) {
+    $("#sidebar").classList.add("is-collapsed");
+    $("#btn-sidebar").setAttribute("aria-expanded", "false");
+    $("#btn-sidebar").textContent = "展開篩選";
   }
 }
 
-function renderRows(items) {
-  const body = $("#rows");
-  body.replaceChildren();
-  $("#empty").hidden = items.length > 0;
-  for (const it of items) {
-    const tr = document.createElement("tr");
-    tr.tabIndex = 0;
-    const idCell = el("td", it.issue_id);
-    if (it.is_sample) { idCell.append(" "); idCell.append(el("span", "範例", "tag sample")); }
-    const projectCell = el("td");
-    projectCell.append(document.createTextNode(it.project || "（未命名）"));
-    if (it.project_id) {
-      projectCell.append(document.createElement("br"));
-      projectCell.append(el("span", it.project_id, "hint"));
+async function pendingDraftCount(projects) {
+  if (!projects.length) return 0;
+  const counts = await Promise.all(projects.map((p) =>
+    api("/api/drafts?" + new URLSearchParams({ project_id: p.project_id, status: "草稿" }))
+      .then((data) => data.items.length)
+      .catch(() => 0)));
+  return counts.reduce((sum, n) => sum + n, 0);
+}
+
+async function refresh() {
+  const facet = new URLSearchParams({ view: state.view });
+  for (const k of ["q", "issue_type", "owner"]) {
+    const v = $("#f-" + k).value.trim();
+    if (v) facet.set(k, v);
+  }
+  const [data, projects, base] = await Promise.all([
+    api("/api/issues?" + query()),
+    api("/api/projects"),
+    api("/api/issues?" + facet.toString()),
+  ]);
+  state.projects = projects.items;
+  state.items = data.items;
+  state.counts = data.counts;
+  state.facetItems = base.items;
+  fillProjectFilter();
+  if (state.selected && !data.items.some((it) => it.issue_id === state.selected)) state.selected = null;
+  if (state.layout === "split" && !state.selected && data.items[0]) state.selected = data.items[0].issue_id;
+  if (state.selected !== state.historyFor) state.history = [];
+  paint();
+  $("#btn-sample-clear").hidden = !data.has_sample;
+  $("#btn-sample-load").hidden = data.has_sample;
+  const pending = await pendingDraftCount(state.projects);
+  const badge = $("#draft-count");
+  badge.textContent = String(pending);
+  if (state.layout === "split" && state.selected && state.historyFor !== state.selected) {
+    loadSplitHistory(state.selected).catch((e) => showMsg(e.message, "error"));
+  }
+}
+
+function loadSections() {
+  const open = { ...SECTION_DEFAULTS };
+  try {
+    const saved = JSON.parse(localStorage.getItem(SECTION_KEY) || "{}");
+    if (saved && typeof saved === "object") {
+      for (const key of Object.keys(SECTION_DEFAULTS)) {
+        if (typeof saved[key] === "boolean") open[key] = saved[key];
+      }
     }
-    tr.append(idCell, projectCell, el("td", it.issue_type), el("td", it.title), el("td", it.owner));
-    tr.append(el("td", (it.due_date || "—") + (it.overdue ? " 逾期" : ""), it.overdue ? "overdue" : ""));
-    tr.append(el("td", it.priority), el("td", it.status), el("td", it.source_status));
-    tr.append(el("td", [it.drawing_no, it.drawing_rev && "版次 " + it.drawing_rev].filter(Boolean).join(" ")));
-    tr.append(el("td", [it.model_file, it.model_element_id].filter(Boolean).join(" #")));
-    const open = () => openIssue(it.issue_id).catch((e) => showMsg(e.message, "error"));
-    tr.addEventListener("click", open);
-    tr.addEventListener("keydown", (ev) => { if (ev.key === "Enter") open(); });
-    body.append(tr);
+  } catch (e) { /* 用預設：只有檢視展開 */ }
+  return open;
+}
+
+function saveSections() {
+  try { localStorage.setItem(SECTION_KEY, JSON.stringify(state.sections)); } catch (e) { /* 仍可在這次工作階段開關 */ }
+}
+
+function sideIcon(paths) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("width", "16");
+  svg.setAttribute("height", "16");
+  svg.setAttribute("aria-hidden", "true");
+  svg.classList.add("side-ico");
+  for (const d of paths) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", d);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "currentColor");
+    path.setAttribute("stroke-width", "1.4");
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("stroke-linejoin", "round");
+    svg.append(path);
+  }
+  return svg;
+}
+
+const SECTION_ICONS = {
+  view: ["M2.5 4h11", "M2.5 8h11", "M2.5 12h7"],
+  project: ["M2 5.2h3.6l1.2 1.4H14V13H2z"],
+  status: ["M8 2.6a5.4 5.4 0 1 0 0 10.8 5.4 5.4 0 0 0 0-10.8", "M8 5.2v3l1.8 1.2"],
+  priority: ["M3.4 2.4v11.2", "M3.4 3.2h8.2L10 5.4l1.6 2.2H3.4"],
+  source: ["M4 2.4h5.2L12.4 5.6V13.6H4z", "M9.2 2.6V5.8h3"],
+};
+
+function syncSection(wrap, id) {
+  const open = Boolean(state.sections[id]);
+  wrap.classList.toggle("is-open", open);
+  const head = wrap.querySelector(".side-head");
+  const panel = wrap.querySelector(".side-items");
+  const hint = wrap.querySelector(".side-hint");
+  head.setAttribute("aria-expanded", open ? "true" : "false");
+  panel.inert = !open;
+  if (hint) hint.hidden = open || !hint.dataset.label;
+}
+
+function sideGroup(id, name, options, onPick, hint) {
+  if (!state.sections) state.sections = loadSections();
+  const wrap = el("div", "", "side-group");
+  wrap.dataset.section = id;
+  const head = el("button", "", "side-head");
+  head.type = "button";
+  head.append(sideIcon(SECTION_ICONS[id]));
+  head.append(el("span", name, "side-head-label"));
+  const hintEl = el("span", hint || "", "side-hint");
+  hintEl.dataset.label = hint || "";
+  if (hint) hintEl.title = hint;
+  const chev = el("span", "›", "side-chevron");
+  chev.setAttribute("aria-hidden", "true");
+  head.append(hintEl, chev);
+  const panel = el("div", "", "side-items");
+  panel.id = "side-sec-" + id;
+  head.setAttribute("aria-controls", panel.id);
+  const inner = el("div", "");
+  for (const opt of options) {
+    const button = el("button", "", "side-opt" + (opt.on ? " is-on" : ""));
+    button.type = "button";
+    button.setAttribute("aria-pressed", opt.on ? "true" : "false");
+    button.append(el("span", opt.label, "side-opt-label"), el("span", String(opt.count), "side-count"));
+    button.addEventListener("click", () => onPick(opt));
+    inner.append(button);
+  }
+  panel.append(inner);
+  head.addEventListener("click", () => {
+    if (state.sidebarIcons) {
+      applyIconMode(false);
+      state.sections[id] = true;
+    } else {
+      state.sections[id] = !state.sections[id];
+    }
+    saveSections();
+    syncSection(wrap, id);
+  });
+  wrap.append(head, panel);
+  syncSection(wrap, id);
+  return wrap;
+}
+
+function applyIconMode(on) {
+  state.sidebarIcons = Boolean(on);
+  const narrow = window.matchMedia("(max-width: 860px)").matches;
+  $("#sidebar").classList.toggle("is-icons", state.sidebarIcons && !narrow);
+  const btn = $("#btn-side-icons");
+  if (btn) {
+    btn.setAttribute("aria-pressed", state.sidebarIcons ? "true" : "false");
+    btn.setAttribute("aria-label", state.sidebarIcons ? "展開側欄" : "收合為圖示");
+  }
+  try { localStorage.setItem(ICONS_KEY, state.sidebarIcons ? "1" : "0"); } catch (e) { /* 這次仍可收合 */ }
+}
+
+function renderSidebar() {
+  const nav = $("#side-filters");
+  nav.replaceChildren();
+  const counts = state.counts || {};
+  const viewOpts = META.views.map((v) => ({
+    value: v, label: VIEW_LABELS[v], count: counts[v] ?? 0, on: state.view === v,
+  }));
+  nav.append(sideGroup("view", "檢視", viewOpts, (opt) => {
+    if (state.view === opt.value) return;
+    state.view = opt.value;
+    refresh().catch((e) => showMsg(e.message, "error"));
+  }, (viewOpts.find((o) => o.on && o.value !== "all") || {}).label || ""));
+  const byProject = tally(state.facetItems, "project_id");
+  const projectOpts = [];
+  for (const p of state.projects) {
+    projectOpts.push({
+      value: p.project_id, label: p.name || "（未命名）", count: byProject.get(p.project_id) || 0,
+      on: $("#f-project").value === p.project_id,
+    });
+  }
+  nav.append(sideGroup("project", "專案", projectOpts, (opt) => setSelect("project", opt.value, opt.value !== ""),
+    (projectOpts.find((o) => o.on) || {}).label || ""));
+  const projectId = $("#f-project").value;
+  const scoped = projectId ? state.facetItems.filter((it) => it.project_id === projectId) : state.facetItems;
+  const byStatus = tally(scoped, "status");
+  const statusOpts = META.statuses.map((s) => ({
+    value: s, label: s, count: byStatus.get(s) || 0, on: $("#f-status").value === s,
+  }));
+  nav.append(sideGroup("status", "狀態", statusOpts, (opt) => setSelect("status", opt.value, true),
+    (statusOpts.find((o) => o.on) || {}).label || ""));
+  const byPriority = tally(scoped, "priority");
+  const priOpts = META.priorities.map((s) => ({
+    value: s, label: s, count: byPriority.get(s) || 0, on: $("#f-priority").value === s,
+  }));
+  nav.append(sideGroup("priority", "優先級", priOpts, (opt) => setSelect("priority", opt.value, true),
+    (priOpts.find((o) => o.on) || {}).label || ""));
+  const bySource = tally(scoped, "source_status");
+  const srcOpts = META.source_statuses.map((s) => ({
+    value: s, label: s, count: bySource.get(s) || 0, on: $("#f-source_status").value === s,
+  }));
+  nav.append(sideGroup("source", "來源狀態", srcOpts, (opt) => setSelect("source_status", opt.value, true),
+    (srcOpts.find((o) => o.on) || {}).label || ""));
+}
+
+function renderViewSegments() {
+  const box = $("#view-segments");
+  box.replaceChildren();
+  for (const v of META.views) {
+    const button = el("button", `${VIEW_LABELS[v]} ${state.counts[v] ?? 0}`);
+    button.type = "button";
+    button.setAttribute("aria-pressed", state.view === v ? "true" : "false");
+    if (v === "overdue") button.classList.add("is-overdue");
+    button.addEventListener("click", () => {
+      if (state.view === v) return;
+      state.view = v;
+      refresh().catch((e) => showMsg(e.message, "error"));
+    });
+    box.append(button);
+  }
+}
+
+function statusChip(issue) {
+  const chip = el("span", issue.status || "—", "chip");
+  chip.dataset.status = issue.status || "";
+  return chip;
+}
+
+function sourceMark(issue) {
+  const src = el("span", "", "src");
+  src.dataset.src = issue.source_status || "";
+  const dot = document.createElement("i");
+  dot.className = "src-dot";
+  dot.setAttribute("aria-hidden", "true");
+  src.append(dot, document.createTextNode(issue.source_status || "—"));
+  return src;
+}
+
+function renderCard(issue, segment) {
+  const open = state.expanded === issue.issue_id;
+  const card = el("article", "", "kcard" + (open ? " is-open" : ""));
+  card.dataset.issueId = issue.issue_id;
+  const main = el("button", "", "kcard-main");
+  main.type = "button";
+  main.dataset.issueId = issue.issue_id;
+  main.setAttribute("aria-expanded", open ? "true" : "false");
+  if (segment) {
+    main.draggable = true;
+    main.addEventListener("dragstart", (ev) => {
+      ev.dataTransfer.setData("text/plain", issue.issue_id);
+      ev.dataTransfer.effectAllowed = "move";
+      card.classList.add("is-dragging");
+    });
+    main.addEventListener("dragend", () => {
+      card.classList.remove("is-dragging");
+      main.dataset.justDragged = "1";
+      setTimeout(() => { delete main.dataset.justDragged; }, 0);
+    });
+  }
+  const top = el("div", "", "kcard-top");
+  const id = el("span", issue.issue_id, "mono");
+  if (issue.is_sample) id.append(el("span", "範例", "tag sample"));
+  const due = el("span", dueLabel(issue), issue.overdue ? "due overdue" : "due");
+  if (issue.due_date) due.title = issue.due_date;
+  top.append(id, due);
+  main.append(top, el("div", issue.title, "kcard-title"));
+  const meta = el("div", "", "kcard-meta");
+  meta.append(statusChip(issue));
+  if (segment) meta.append(el("span", drawingLabel(issue), "dwg"));
+  else {
+    meta.append(sourceMark(issue));
+    if (issue.owner) meta.append(el("span", issue.owner, "owner"));
+  }
+  main.append(meta);
+  main.addEventListener("click", () => {
+    if (main.dataset.justDragged) return;
+    state.expanded = open ? null : issue.issue_id;
+    paint();
+    const root = state.layout === "segment" ? "#view-segment" : "#view-board";
+    const again = document.querySelector(`${root} [data-issue-id="${CSS.escape(issue.issue_id)}"] .kcard-main`);
+    if (again) again.focus();
+  });
+  card.append(main);
+  if (open) card.append(renderCardMore(issue, segment));
+  return card;
+}
+
+function renderCardMore(issue, segment) {
+  const more = el("div", "", "kcard-more");
+  for (const [label, value] of [["圖號／版次", drawingLabel(issue)], ["模型／元素", modelLabel(issue)], ["來源", issue.source_file || "—"]]) {
+    more.append(el("div", label, "meta-k"), el("div", value, "meta-v"));
+  }
+  if (segment && issue.status !== "處理中") {
+    const actions = el("div", "", "kcard-actions");
+    const move = el("button", "改為處理中");
+    move.type = "button";
+    move.addEventListener("click", () => changeStatus(issue.issue_id, "處理中"));
+    actions.append(move);
+    more.append(actions);
+  }
+  return more;
+}
+
+function groupColumns(items) {
+  const columns = new Map();
+  for (const issue of items) {
+    const key = issue.project_id || "";
+    if (!columns.has(key)) {
+      columns.set(key, {
+        project_id: key,
+        name: issue.project || "（未指定專案）",
+        items: [],
+      });
+    }
+    columns.get(key).items.push(issue);
+  }
+  return [...columns.values()].sort((a, b) => a.project_id.localeCompare(b.project_id));
+}
+
+function renderBoard(root, segment) {
+  root.replaceChildren();
+  for (const column of groupColumns(state.items)) {
+    const col = el("section", "", "kcol");
+    const head = el("div", "", "kcol-head");
+    head.append(el("div", column.name, "kcol-name"));
+    const meta = el("div", "", "kcol-meta");
+    meta.append(el("span", column.project_id || "—", "mono"), document.createTextNode(` · ${column.items.length}`));
+    head.append(meta);
+    col.append(head);
+    for (const issue of column.items) col.append(renderCard(issue, segment));
+    if (segment) col.append(dropZone());
+    root.append(col);
+  }
+}
+
+function dropZone() {
+  const zone = el("div", "放開即改為「處理中」", "dropzone");
+  zone.addEventListener("dragover", (ev) => {
+    ev.preventDefault();
+    zone.classList.add("is-over");
+  });
+  zone.addEventListener("dragleave", () => zone.classList.remove("is-over"));
+  zone.addEventListener("drop", (ev) => {
+    ev.preventDefault();
+    zone.classList.remove("is-over");
+    const id = ev.dataTransfer.getData("text/plain");
+    if (id) changeStatus(id, "處理中");
+  });
+  return zone;
+}
+
+function renderSplitItem(issue) {
+  const on = state.selected === issue.issue_id;
+  const button = el("button", "", "split-item" + (on ? " is-on" : ""));
+  button.type = "button";
+  button.setAttribute("aria-pressed", on ? "true" : "false");
+  const top = el("div", "", "split-top");
+  const id = el("span", issue.issue_id, "mono");
+  if (issue.is_sample) id.append(el("span", "範例", "tag sample"));
+  const due = el("span", dueLabel(issue), issue.overdue ? "due overdue" : "due");
+  if (issue.due_date) due.title = issue.due_date;
+  top.append(id, due);
+  const meta = el("div", "", "split-meta");
+  meta.append(statusChip(issue), sourceMark(issue));
+  if (issue.owner) meta.append(el("span", issue.owner, "owner"));
+  button.append(top, el("div", issue.title, "split-title"), meta);
+  button.addEventListener("click", () => selectIssue(issue.issue_id));
+  return button;
+}
+
+function renderSplit() {
+  const list = $("#split-list");
+  const detail = $("#split-detail");
+  list.replaceChildren();
+  detail.replaceChildren();
+  for (const issue of state.items) list.append(renderSplitItem(issue));
+  const issue = state.items.find((it) => it.issue_id === state.selected);
+  if (!issue) {
+    detail.append(el("p", "選取左側事項以查看證據與變更紀錄。", "hint"));
+    return;
+  }
+  const head = el("div", "", "detail-head");
+  head.append(el("span", `${issue.issue_id} · ${issue.project || "（未指定專案）"}`, "mono"));
+  head.append(el("span", issue.issue_type || "—"));
+  detail.append(head, el("h2", issue.title, "detail-title"));
+  const grid = el("div", "", "detail-grid");
+  const fields = [
+    ["狀態", issue.status || "—", ""],
+    ["來源狀態", issue.source_status || "—", ""],
+    ["負責人", issue.owner || "—", ""],
+    ["期限", dueLabel(issue), issue.overdue ? "overdue" : ""],
+    ["圖號／版次", drawingLabel(issue), ""],
+    ["模型／元素", modelLabel(issue), ""],
+  ];
+  for (const [label, value, cls] of fields) {
+    grid.append(el("div", label, "meta-k"), el("div", value, cls));
+  }
+  detail.append(grid);
+  const evidence = el("div", "");
+  const bits = ["來源證據"];
+  if (issue.source_file) bits.push(issue.source_file);
+  if (issue.source_location) bits.push(issue.source_location);
+  evidence.append(el("div", bits.join(" · "), "hint"));
+  evidence.append(el("pre", issue.source_quote || issue.source_excerpt || "（沒有原文摘錄）", "quote"));
+  detail.append(evidence);
+  const histWrap = el("div", "");
+  histWrap.append(el("div", "變更紀錄", "hint"));
+  const hist = el("div", "");
+  hist.id = "split-history";
+  histWrap.append(hist);
+  detail.append(histWrap);
+  if (state.historyFor === issue.issue_id) fillHistory(hist, state.history);
+  else hist.append(el("p", "載入變更紀錄…", "hint"));
+  const actions = el("div", "", "detail-actions");
+  const docs = el("button", "關聯工程文件");
+  docs.type = "button";
+  docs.addEventListener("click", () => openIssue(issue.issue_id).catch((e) => showMsg(e.message, "error")));
+  const edit = el("button", "編輯");
+  edit.type = "button";
+  edit.addEventListener("click", () => openIssue(issue.issue_id).catch((e) => showMsg(e.message, "error")));
+  const accept = el("button", "送驗收", "primary");
+  accept.type = "button";
+  accept.disabled = issue.status === "待驗收" || issue.status === "已驗收" || issue.status === "已關閉";
+  accept.addEventListener("click", () => changeStatus(issue.issue_id, "待驗收"));
+  actions.append(docs, edit, accept);
+  detail.append(actions);
+}
+
+function fillHistory(box, items) {
+  box.replaceChildren();
+  if (!items.length) {
+    box.append(el("p", "沒有變更紀錄。", "hint"));
+    return;
+  }
+  for (const row of items.slice().reverse()) {
+    const line = el("div", "", "hist-row");
+    const fieldLabel = (META.fields.find(([key]) => key === row.field) || [row.field, row.field])[1];
+    const change = row.old_value ? `${row.old_value} → ${row.new_value}` : (row.new_value || "");
+    line.append(el("span", row.changed_at, "mono"), el("span", row.operator), el("span", fieldLabel), el("span", change));
+    box.append(line);
+  }
+}
+
+function selectIssue(id) {
+  state.selected = id;
+  state.history = [];
+  state.historyFor = null;
+  paint();
+  loadSplitHistory(id).catch((e) => showMsg(e.message, "error"));
+}
+
+async function loadSplitHistory(id) {
+  const hist = await api(`/api/issues/${encodeURIComponent(id)}/history`);
+  if (state.selected !== id) return;
+  state.history = hist.items;
+  state.historyFor = id;
+  const box = $("#split-history");
+  if (box) fillHistory(box, hist.items);
+}
+
+async function changeStatus(id, status) {
+  const current = state.items.find((it) => it.issue_id === id);
+  if (!current || current.status === status) return;
+  try {
+    const res = await api("/api/issues/" + encodeURIComponent(id), { method: "PUT", json: { status } });
+    const note = res.warnings && res.warnings.length ? `${id} 已更新，注意：\n` + res.warnings.join("\n") : `${id} 狀態已改為「${status}」`;
+    showMsg(note, res.warnings && res.warnings.length ? "warn" : "");
+    if (state.selected === id) state.historyFor = null;
+    await refresh();
+  } catch (e) {
+    showMsg(e.message, "error");
+  }
+}
+
+function paint() {
+  const remember = ["#view-board", "#view-segment", "#split-list", "#side-body"];
+  const saved = new Map();
+  for (const sel of remember) {
+    const node = $(sel);
+    saved.set(sel, {
+      top: node.scrollTop,
+      left: node.scrollLeft,
+      cols: [...node.querySelectorAll(".kcol")].map((col) => col.scrollTop),
+    });
+  }
+  renderSidebar();
+  renderViewSegments();
+  renderBoard($("#view-board"), false);
+  renderBoard($("#view-segment"), true);
+  renderSplit();
+  $("#empty").hidden = state.items.length > 0;
+  for (const [sel, pos] of saved) {
+    const node = $(sel);
+    node.scrollTop = pos.top;
+    node.scrollLeft = pos.left;
+    node.querySelectorAll(".kcol").forEach((col, i) => {
+      if (pos.cols[i] != null) col.scrollTop = pos.cols[i];
+    });
   }
 }
 
@@ -250,6 +774,7 @@ async function saveIssue(ev) {
       ? await api("/api/issues/" + encodeURIComponent(state.editing), { method: "PUT", json: data })
       : await api("/api/issues", { method: "POST", json: data });
     $("#dlg-issue").close();
+    state.historyFor = null;
     const id = res.issue.issue_id;
     showMsg(res.warnings.length ? `${id} 已儲存，注意：\n` + res.warnings.join("\n") : `${id} 已儲存`,
       res.warnings.length ? "warn" : "");
@@ -611,6 +1136,8 @@ async function init() {
   META = await api("/api/meta");
   $("#operator").textContent = META.operator;
   $("#today").textContent = META.today;
+  applyStoredTheme();
+  applyStoredLayout();
   fillSelect($("#f-issue_type"), META.issue_types);
   fillSelect($("#f-status"), META.statuses);
   fillSelect($("#f-priority"), META.priorities);
@@ -656,6 +1183,33 @@ async function init() {
     $("#rename-name").value = current ? current.name : "";
   });
   $("#btn-doc-search").addEventListener("click", () => searchDocs());
+  $("#btn-theme").addEventListener("click", () => {
+    applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+  });
+  $("#btn-sidebar").addEventListener("click", () => {
+    const collapsed = $("#sidebar").classList.toggle("is-collapsed");
+    $("#btn-sidebar").setAttribute("aria-expanded", collapsed ? "false" : "true");
+    $("#btn-sidebar").textContent = collapsed ? "展開篩選" : "收合篩選";
+  });
+  try { state.sidebarIcons = localStorage.getItem(ICONS_KEY) === "1"; } catch (e) { state.sidebarIcons = false; }
+  applyIconMode(state.sidebarIcons);
+  $("#btn-side-icons").addEventListener("click", () => applyIconMode(!state.sidebarIcons));
+  // body 也有 data-layout（給版面 CSS）。若把監聽掛到 body，側欄分區的點擊會冒泡上來，
+  // 重繪整個側欄並把鍵盤焦點打回 body。只綁真正的版面按鈕。
+  for (const button of document.querySelectorAll("button[data-layout]")) {
+    button.addEventListener("click", () => {
+      applyLayout(button.dataset.layout);
+      if (state.items) {
+        paint();
+        if (state.layout === "split" && state.selected && state.historyFor !== state.selected) {
+          loadSplitHistory(state.selected).catch((e) => showMsg(e.message, "error"));
+        }
+      }
+    });
+  }
+  $("#more-menu").addEventListener("click", (ev) => {
+    if (ev.target.closest("button, a")) $("#more-menu").open = false;
+  });
   await refresh();
 }
 

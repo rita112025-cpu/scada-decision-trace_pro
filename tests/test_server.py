@@ -41,6 +41,18 @@ class TestServer(unittest.TestCase):
         status, body = self.req("GET", "/", raw=True)
         self.assertEqual(status, 200)
         self.assertIn("決議".encode("utf-8"), body)
+        self.assertIn(b'<link rel="icon" href="/static/app.ico"', body)
+
+    def test_favicon_is_icon(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/static/app.ico", headers={"Host": f"127.0.0.1:{self.port}"})
+        r = c.getresponse()
+        payload = r.read()
+        ctype = r.getheader("Content-Type")
+        c.close()
+        self.assertEqual(r.status, 200)
+        self.assertEqual(ctype, "image/x-icon")
+        self.assertTrue(payload.startswith(b"\x00\x00\x01\x00"))
 
     def test_create_update_history_flow(self):
         s, r = self.req("POST", "/api/issues", {"title": "HTTP 建立", "source_status": "已確認"})
