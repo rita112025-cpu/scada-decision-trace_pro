@@ -187,7 +187,6 @@ async function refresh() {
   const pending = await pendingDraftCount(state.projects);
   const badge = $("#draft-count");
   badge.textContent = String(pending);
-  badge.hidden = pending <= 0;
   if (state.layout === "split" && state.selected && state.historyFor !== state.selected) {
     loadSplitHistory(state.selected).catch((e) => showMsg(e.message, "error"));
   }
@@ -219,9 +218,7 @@ function renderSidebar() {
     refresh().catch((e) => showMsg(e.message, "error"));
   }));
   const byProject = tally(state.facetItems, "project_id");
-  const projectOpts = [{
-    value: "", label: "全部專案", count: state.facetItems.length, on: $("#f-project").value === "",
-  }];
+  const projectOpts = [];
   for (const p of state.projects) {
     projectOpts.push({
       value: p.project_id, label: p.name || "（未命名）", count: byProject.get(p.project_id) || 0,
@@ -232,7 +229,7 @@ function renderSidebar() {
   const projectId = $("#f-project").value;
   const scoped = projectId ? state.facetItems.filter((it) => it.project_id === projectId) : state.facetItems;
   const byStatus = tally(scoped, "status");
-  nav.append(sideGroup("狀態", META.statuses.map((s) => ({
+  nav.append(sideGroup("狀態", META.statuses.filter((s) => s !== "已關閉" || (byStatus.get(s) || 0) > 0).map((s) => ({
     value: s, label: s, count: byStatus.get(s) || 0, on: $("#f-status").value === s,
   })), (opt) => setSelect("status", opt.value, true)));
   const byPriority = tally(scoped, "priority");
@@ -309,7 +306,10 @@ function renderCard(issue, segment) {
   const meta = el("div", "", "kcard-meta");
   meta.append(statusChip(issue));
   if (segment) meta.append(el("span", drawingLabel(issue), "dwg"));
-  else meta.append(sourceMark(issue), el("span", issue.owner || "—", "owner"));
+  else {
+    meta.append(sourceMark(issue));
+    if (issue.owner) meta.append(el("span", issue.owner, "owner"));
+  }
   main.append(meta);
   main.addEventListener("click", () => {
     if (main.dataset.justDragged) return;
@@ -329,18 +329,14 @@ function renderCardMore(issue, segment) {
   for (const [label, value] of [["圖號／版次", drawingLabel(issue)], ["模型／元素", modelLabel(issue)], ["來源", issue.source_file || "—"]]) {
     more.append(el("div", label, "meta-k"), el("div", value, "meta-v"));
   }
-  const actions = el("div", "", "kcard-actions");
-  const edit = el("button", "編輯");
-  edit.type = "button";
-  edit.addEventListener("click", () => openIssue(issue.issue_id).catch((e) => showMsg(e.message, "error")));
-  actions.append(edit);
   if (segment && issue.status !== "處理中") {
+    const actions = el("div", "", "kcard-actions");
     const move = el("button", "改為處理中");
     move.type = "button";
     move.addEventListener("click", () => changeStatus(issue.issue_id, "處理中"));
     actions.append(move);
+    more.append(actions);
   }
-  more.append(actions);
   return more;
 }
 
@@ -404,7 +400,8 @@ function renderSplitItem(issue) {
   if (issue.due_date) due.title = issue.due_date;
   top.append(id, due);
   const meta = el("div", "", "split-meta");
-  meta.append(statusChip(issue), sourceMark(issue), el("span", issue.owner || "—", "owner"));
+  meta.append(statusChip(issue), sourceMark(issue));
+  if (issue.owner) meta.append(el("span", issue.owner, "owner"));
   button.append(top, el("div", issue.title, "split-title"), meta);
   button.addEventListener("click", () => selectIssue(issue.issue_id));
   return button;
@@ -1087,9 +1084,9 @@ async function init() {
     $("#btn-sidebar").setAttribute("aria-expanded", collapsed ? "false" : "true");
     $("#btn-sidebar").textContent = collapsed ? "展開篩選" : "收合篩選";
   });
-  for (const id of ["layout-board", "layout-split", "layout-segment"]) {
-    $("#" + id).addEventListener("click", () => {
-      applyLayout($("#" + id).dataset.layout);
+  for (const button of document.querySelectorAll("[data-layout]")) {
+    button.addEventListener("click", () => {
+      applyLayout(button.dataset.layout);
       if (state.items) {
         paint();
         if (state.layout === "split" && state.selected && state.historyFor !== state.selected) {

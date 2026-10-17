@@ -11,12 +11,12 @@
 <header class="top">
   <div class="brand">
     <h1>SCADA 決議—模型—圖紙追蹤器</h1>
-    <p class="sub">本機資料 · 操作者：<span id="operator">-</span> · 今天：<span id="today">-</span></p>
+    <p class="sub">本機資料 · 操作者:<span id="operator">-</span> · 今天:<span id="today">-</span></p>
   </div>
   <div class="actions">
     <button id="btn-new" class="primary" type="button">＋ 新增事項</button>
     <button id="btn-import" type="button">匯入逐字稿</button>
-    <button id="btn-drafts" type="button">審核草稿<span id="draft-count" class="count-badge" hidden>0</span></button>
+    <button id="btn-drafts" type="button">審核草稿 <span id="draft-count">0</span></button>
     <label class="btn">匯入 CSV<input id="file-import" type="file" accept=".csv,text/csv" hidden></label>
     <a id="btn-export" class="btn" href="/api/export.csv">匯出 CSV</a>
     <details class="more" id="more-menu">
@@ -28,6 +28,23 @@
         <button id="btn-backup" type="button">備份</button>
         <button id="btn-sample-load" type="button">載入範例</button>
         <button id="btn-sample-clear" class="danger" type="button">清除範例</button>
+        <button type="button" class="layout-more" data-layout="board">看板</button>
+        <button type="button" class="layout-more" data-layout="split">清單</button>
+        <button type="button" class="layout-more" data-layout="segment">分段</button>
+        <details class="advanced">
+          <summary>排序與其他篩選</summary>
+          <label>類型<select id="f-issue_type"><option value="">全部類型</option></select></label>
+          <label>負責人<input id="f-owner" type="text" placeholder="負責人" aria-label="負責人"></label>
+          <label>排序<select id="f-sort" aria-label="排序">
+            <option value="due_date">依期限</option>
+            <option value="priority">依優先級</option>
+            <option value="updated_at">依更新時間</option>
+            <option value="issue_id">依編號</option>
+            <option value="status">依狀態</option>
+            <option value="owner">依負責人</option>
+          </select></label>
+          <label>順序<select id="f-order" aria-label="順序"><option value="asc">升冪</option><option value="desc">降冪</option></select></label>
+        </details>
       </div>
     </details>
     <button id="btn-theme" class="theme-toggle" type="button" aria-pressed="true">☀ 切換為淺粉</button>
@@ -44,20 +61,6 @@
         <input id="f-q" type="search" placeholder="搜尋編號、標題、圖號、模型…" aria-label="搜尋編號、標題、描述、來源、圖號或模型">
       </div>
       <nav id="side-filters" class="side-filters" aria-label="篩選"></nav>
-      <details class="advanced">
-        <summary>排序與其他篩選</summary>
-        <label>類型<select id="f-issue_type"><option value="">全部類型</option></select></label>
-        <label>負責人<input id="f-owner" type="text" placeholder="負責人" aria-label="負責人"></label>
-        <label>排序<select id="f-sort" aria-label="排序">
-          <option value="due_date">依期限</option>
-          <option value="priority">依優先級</option>
-          <option value="updated_at">依更新時間</option>
-          <option value="issue_id">依編號</option>
-          <option value="status">依狀態</option>
-          <option value="owner">依負責人</option>
-        </select></label>
-        <label>順序<select id="f-order" aria-label="順序"><option value="asc">升冪</option><option value="desc">降冪</option></select></label>
-      </details>
       <select id="f-project" hidden aria-hidden="true"><option value="">全部專案</option></select>
       <select id="f-status" hidden aria-hidden="true"><option value="">全部狀態</option></select>
       <select id="f-priority" hidden aria-hidden="true"><option value="">全部優先級</option></select>
