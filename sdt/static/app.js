@@ -5,6 +5,9 @@ const $ = (sel) => document.querySelector(sel);
 const VIEW_LABELS = { all: "全部", open: "未結", overdue: "逾期", disputed: "待確認／有爭議", accepted: "已驗收" };
 const THEME_KEY = "sdt-theme";
 const LAYOUT_KEY = "sdt-layout";
+const SECTION_KEY = "sdt-sidebar-sections";
+const ICONS_KEY = "sdt-sidebar-icons";
+const SECTION_DEFAULTS = { view: true, project: false, status: false, priority: false, source: false };
 const TEXTAREAS = new Set(["description", "source_excerpt", "acceptance_criteria"]);
 const ACTION_LABELS = {
   create: "新增", update: "修改", import: "匯入", sample: "範例", "clear-sample": "清除範例",
@@ -15,7 +18,7 @@ let META = null;
 let state = {
   view: "all", editing: null, editingIssue: null, projects: [], importFile: null,
   layout: "board", expanded: null, selected: null, items: [], facetItems: [], counts: {},
-  history: [], historyFor: null,
+  history: [], historyFor: null, sections: null, sidebarIcons: false,
 };
 
 async function api(path, opts = {}) {
@@ -192,31 +195,126 @@ async function refresh() {
   }
 }
 
-function sideGroup(name, options, onPick) {
+function loadSections() {
+  const open = { ...SECTION_DEFAULTS };
+  try {
+    const saved = JSON.parse(localStorage.getItem(SECTION_KEY) || "{}");
+    if (saved && typeof saved === "object") {
+      for (const key of Object.keys(SECTION_DEFAULTS)) {
+        if (typeof saved[key] === "boolean") open[key] = saved[key];
+      }
+    }
+  } catch (e) { /* 用預設：只有檢視展開 */ }
+  return open;
+}
+
+function saveSections() {
+  try { localStorage.setItem(SECTION_KEY, JSON.stringify(state.sections)); } catch (e) { /* 仍可在這次工作階段開關 */ }
+}
+
+function sideIcon(paths) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("width", "16");
+  svg.setAttribute("height", "16");
+  svg.setAttribute("aria-hidden", "true");
+  svg.classList.add("side-ico");
+  for (const d of paths) {
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", d);
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "currentColor");
+    path.setAttribute("stroke-width", "1.4");
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("stroke-linejoin", "round");
+    svg.append(path);
+  }
+  return svg;
+}
+
+const SECTION_ICONS = {
+  view: ["M2.5 4h11", "M2.5 8h11", "M2.5 12h7"],
+  project: ["M2 5.2h3.6l1.2 1.4H14V13H2z"],
+  status: ["M8 2.6a5.4 5.4 0 1 0 0 10.8 5.4 5.4 0 0 0 0-10.8", "M8 5.2v3l1.8 1.2"],
+  priority: ["M3.4 2.4v11.2", "M3.4 3.2h8.2L10 5.4l1.6 2.2H3.4"],
+  source: ["M4 2.4h5.2L12.4 5.6V13.6H4z", "M9.2 2.6V5.8h3"],
+};
+
+function syncSection(wrap, id) {
+  const open = Boolean(state.sections[id]);
+  wrap.classList.toggle("is-open", open);
+  const head = wrap.querySelector(".side-head");
+  const panel = wrap.querySelector(".side-items");
+  head.setAttribute("aria-expanded", open ? "true" : "false");
+  panel.inert = !open;
+}
+
+function sideGroup(id, name, options, onPick, hint) {
+  if (!state.sections) state.sections = loadSections();
   const wrap = el("div", "", "side-group");
-  wrap.append(el("div", name, "side-label"));
+  wrap.dataset.section = id;
+  const head = el("button", "", "side-head");
+  head.type = "button";
+  head.append(sideIcon(SECTION_ICONS[id]));
+  head.append(el("span", name, "side-head-label"));
+  const hintEl = el("span", hint || "", "side-hint");
+  hintEl.hidden = !hint;
+  if (hint) hintEl.title = hint;
+  const chev = el("span", "›", "side-chevron");
+  chev.setAttribute("aria-hidden", "true");
+  head.append(hintEl, chev);
+  const panel = el("div", "", "side-items");
+  panel.id = "side-sec-" + id;
+  head.setAttribute("aria-controls", panel.id);
+  const inner = el("div", "");
   for (const opt of options) {
     const button = el("button", "", "side-opt" + (opt.on ? " is-on" : ""));
     button.type = "button";
     button.setAttribute("aria-pressed", opt.on ? "true" : "false");
-    button.append(el("span", opt.label), el("span", String(opt.count), "side-count"));
+    button.append(el("span", opt.label, "side-opt-label"), el("span", String(opt.count), "side-count"));
     button.addEventListener("click", () => onPick(opt));
-    wrap.append(button);
+    inner.append(button);
   }
+  panel.append(inner);
+  head.addEventListener("click", () => {
+    if (state.sidebarIcons) {
+      applyIconMode(false);
+      state.sections[id] = true;
+    } else {
+      state.sections[id] = !state.sections[id];
+    }
+    saveSections();
+    syncSection(wrap, id);
+  });
+  wrap.append(head, panel);
+  syncSection(wrap, id);
   return wrap;
+}
+
+function applyIconMode(on) {
+  state.sidebarIcons = Boolean(on);
+  const narrow = window.matchMedia("(max-width: 860px)").matches;
+  $("#sidebar").classList.toggle("is-icons", state.sidebarIcons && !narrow);
+  const btn = $("#btn-side-icons");
+  if (btn) {
+    btn.setAttribute("aria-pressed", state.sidebarIcons ? "true" : "false");
+    btn.setAttribute("aria-label", state.sidebarIcons ? "展開側欄" : "收合為圖示");
+  }
+  try { localStorage.setItem(ICONS_KEY, state.sidebarIcons ? "1" : "0"); } catch (e) { /* 這次仍可收合 */ }
 }
 
 function renderSidebar() {
   const nav = $("#side-filters");
   nav.replaceChildren();
   const counts = state.counts || {};
-  nav.append(sideGroup("檢視", META.views.map((v) => ({
+  const viewOpts = META.views.map((v) => ({
     value: v, label: VIEW_LABELS[v], count: counts[v] ?? 0, on: state.view === v,
-  })), (opt) => {
+  }));
+  nav.append(sideGroup("view", "檢視", viewOpts, (opt) => {
     if (state.view === opt.value) return;
     state.view = opt.value;
     refresh().catch((e) => showMsg(e.message, "error"));
-  }));
+  }, (viewOpts.find((o) => o.on && o.value !== "all") || {}).label || ""));
   const byProject = tally(state.facetItems, "project_id");
   const projectOpts = [];
   for (const p of state.projects) {
@@ -225,21 +323,28 @@ function renderSidebar() {
       on: $("#f-project").value === p.project_id,
     });
   }
-  nav.append(sideGroup("專案", projectOpts, (opt) => setSelect("project", opt.value, opt.value !== "")));
+  nav.append(sideGroup("project", "專案", projectOpts, (opt) => setSelect("project", opt.value, opt.value !== ""),
+    (projectOpts.find((o) => o.on) || {}).label || ""));
   const projectId = $("#f-project").value;
   const scoped = projectId ? state.facetItems.filter((it) => it.project_id === projectId) : state.facetItems;
   const byStatus = tally(scoped, "status");
-  nav.append(sideGroup("狀態", META.statuses.filter((s) => s !== "已關閉" || (byStatus.get(s) || 0) > 0).map((s) => ({
+  const statusOpts = META.statuses.map((s) => ({
     value: s, label: s, count: byStatus.get(s) || 0, on: $("#f-status").value === s,
-  })), (opt) => setSelect("status", opt.value, true)));
+  }));
+  nav.append(sideGroup("status", "狀態", statusOpts, (opt) => setSelect("status", opt.value, true),
+    (statusOpts.find((o) => o.on) || {}).label || ""));
   const byPriority = tally(scoped, "priority");
-  nav.append(sideGroup("優先級", META.priorities.map((s) => ({
+  const priOpts = META.priorities.map((s) => ({
     value: s, label: s, count: byPriority.get(s) || 0, on: $("#f-priority").value === s,
-  })), (opt) => setSelect("priority", opt.value, true)));
+  }));
+  nav.append(sideGroup("priority", "優先級", priOpts, (opt) => setSelect("priority", opt.value, true),
+    (priOpts.find((o) => o.on) || {}).label || ""));
   const bySource = tally(scoped, "source_status");
-  nav.append(sideGroup("來源狀態", META.source_statuses.map((s) => ({
+  const srcOpts = META.source_statuses.map((s) => ({
     value: s, label: s, count: bySource.get(s) || 0, on: $("#f-source_status").value === s,
-  })), (opt) => setSelect("source_status", opt.value, true)));
+  }));
+  nav.append(sideGroup("source", "來源狀態", srcOpts, (opt) => setSelect("source_status", opt.value, true),
+    (srcOpts.find((o) => o.on) || {}).label || ""));
 }
 
 function renderViewSegments() {
@@ -512,7 +617,7 @@ async function changeStatus(id, status) {
 }
 
 function paint() {
-  const remember = ["#view-board", "#view-segment", "#split-list", "#sidebar"];
+  const remember = ["#view-board", "#view-segment", "#split-list", "#side-body"];
   const saved = new Map();
   for (const sel of remember) {
     const node = $(sel);
@@ -1084,6 +1189,9 @@ async function init() {
     $("#btn-sidebar").setAttribute("aria-expanded", collapsed ? "false" : "true");
     $("#btn-sidebar").textContent = collapsed ? "展開篩選" : "收合篩選";
   });
+  try { state.sidebarIcons = localStorage.getItem(ICONS_KEY) === "1"; } catch (e) { state.sidebarIcons = false; }
+  applyIconMode(state.sidebarIcons);
+  $("#btn-side-icons").addEventListener("click", () => applyIconMode(!state.sidebarIcons));
   for (const button of document.querySelectorAll("[data-layout]")) {
     button.addEventListener("click", () => {
       applyLayout(button.dataset.layout);
