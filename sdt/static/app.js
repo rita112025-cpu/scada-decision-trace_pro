@@ -245,8 +245,10 @@ function syncSection(wrap, id) {
   wrap.classList.toggle("is-open", open);
   const head = wrap.querySelector(".side-head");
   const panel = wrap.querySelector(".side-items");
+  const hint = wrap.querySelector(".side-hint");
   head.setAttribute("aria-expanded", open ? "true" : "false");
   panel.inert = !open;
+  if (hint) hint.hidden = open || !hint.dataset.label;
 }
 
 function sideGroup(id, name, options, onPick, hint) {
@@ -258,7 +260,7 @@ function sideGroup(id, name, options, onPick, hint) {
   head.append(sideIcon(SECTION_ICONS[id]));
   head.append(el("span", name, "side-head-label"));
   const hintEl = el("span", hint || "", "side-hint");
-  hintEl.hidden = !hint;
+  hintEl.dataset.label = hint || "";
   if (hint) hintEl.title = hint;
   const chev = el("span", "›", "side-chevron");
   chev.setAttribute("aria-hidden", "true");
