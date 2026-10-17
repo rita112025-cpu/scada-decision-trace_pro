@@ -4,62 +4,85 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>決議追蹤器</title>
+<link rel="icon" href="/static/app.ico" sizes="any">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header class="top">
-  <div>
+  <div class="brand">
     <h1>SCADA 決議—模型—圖紙追蹤器</h1>
     <p class="sub">本機資料 · 操作者：<span id="operator">-</span> · 今天：<span id="today">-</span></p>
   </div>
   <div class="actions">
-    <button id="btn-new" class="primary">＋ 新增事項</button>
-    <button id="btn-import">匯入逐字稿</button>
-    <button id="btn-drafts">審核草稿</button>
-    <button id="btn-project">專案名稱</button>
-    <button id="btn-agenda">議程草稿</button>
-    <a id="btn-export" class="btn" href="/api/export.csv">匯出 CSV</a>
-    <a class="btn" href="/api/history.csv">匯出變更紀錄</a>
+    <button id="btn-new" class="primary" type="button">＋ 新增事項</button>
+    <button id="btn-import" type="button">匯入逐字稿</button>
+    <button id="btn-drafts" type="button">審核草稿<span id="draft-count" class="count-badge" hidden>0</span></button>
     <label class="btn">匯入 CSV<input id="file-import" type="file" accept=".csv,text/csv" hidden></label>
-    <button id="btn-backup">備份</button>
-    <button id="btn-sample-load">載入範例</button>
-    <button id="btn-sample-clear" class="danger">清除範例</button>
+    <a id="btn-export" class="btn" href="/api/export.csv">匯出 CSV</a>
+    <details class="more" id="more-menu">
+      <summary>更多 ▾</summary>
+      <div class="more-panel">
+        <button id="btn-project" type="button">專案名稱</button>
+        <button id="btn-agenda" type="button">議程草稿</button>
+        <a class="btn" href="/api/history.csv">匯出變更紀錄</a>
+        <button id="btn-backup" type="button">備份</button>
+        <button id="btn-sample-load" type="button">載入範例</button>
+        <button id="btn-sample-clear" class="danger" type="button">清除範例</button>
+      </div>
+    </details>
+    <button id="btn-theme" class="theme-toggle" type="button" aria-pressed="true">☀ 切換為淺粉</button>
   </div>
 </header>
 
-<div id="msg" class="msg" hidden></div>
+<div id="msg" class="msg" role="status" hidden></div>
 
-<nav class="tabs" id="tabs"></nav>
-
-<section class="filters">
-  <input id="f-q" type="search" placeholder="搜尋編號、標題、描述、來源、圖號、模型…">
-  <select id="f-project"><option value="">全部專案</option></select>
-  <select id="f-issue_type"><option value="">全部類型</option></select>
-  <select id="f-status"><option value="">全部狀態</option></select>
-  <select id="f-priority"><option value="">全部優先級</option></select>
-  <select id="f-source_status"><option value="">全部來源狀態</option></select>
-  <input id="f-owner" type="text" placeholder="負責人">
-  <select id="f-sort">
-    <option value="due_date">依期限</option>
-    <option value="priority">依優先級</option>
-    <option value="updated_at">依更新時間</option>
-    <option value="issue_id">依編號</option>
-    <option value="status">依狀態</option>
-    <option value="owner">依負責人</option>
-  </select>
-  <select id="f-order"><option value="asc">升冪</option><option value="desc">降冪</option></select>
-</section>
-
-<main>
-  <table class="grid">
-    <thead><tr>
-      <th>編號</th><th>專案</th><th>類型</th><th>標題</th><th>負責人</th><th>期限</th><th>優先</th>
-      <th>狀態</th><th>來源狀態</th><th>圖號／版次</th><th>模型／元素</th>
-    </tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <p id="empty" class="empty" hidden>沒有符合條件的事項</p>
-</main>
+<div class="workspace">
+  <aside class="sidebar" id="sidebar">
+    <button id="btn-sidebar" class="sidebar-toggle" type="button" aria-expanded="true" aria-controls="side-body">收合篩選</button>
+    <div id="side-body">
+      <div id="search-slot-side">
+        <input id="f-q" type="search" placeholder="搜尋編號、標題、圖號、模型…" aria-label="搜尋編號、標題、描述、來源、圖號或模型">
+      </div>
+      <nav id="side-filters" class="side-filters" aria-label="篩選"></nav>
+      <details class="advanced">
+        <summary>排序與其他篩選</summary>
+        <label>類型<select id="f-issue_type"><option value="">全部類型</option></select></label>
+        <label>負責人<input id="f-owner" type="text" placeholder="負責人" aria-label="負責人"></label>
+        <label>排序<select id="f-sort" aria-label="排序">
+          <option value="due_date">依期限</option>
+          <option value="priority">依優先級</option>
+          <option value="updated_at">依更新時間</option>
+          <option value="issue_id">依編號</option>
+          <option value="status">依狀態</option>
+          <option value="owner">依負責人</option>
+        </select></label>
+        <label>順序<select id="f-order" aria-label="順序"><option value="asc">升冪</option><option value="desc">降冪</option></select></label>
+      </details>
+      <select id="f-project" hidden aria-hidden="true"><option value="">全部專案</option></select>
+      <select id="f-status" hidden aria-hidden="true"><option value="">全部狀態</option></select>
+      <select id="f-priority" hidden aria-hidden="true"><option value="">全部優先級</option></select>
+      <select id="f-source_status" hidden aria-hidden="true"><option value="">全部來源狀態</option></select>
+    </div>
+  </aside>
+  <div class="stage">
+    <div class="stage-bar">
+      <div class="layout-switch" role="tablist" aria-label="畫面">
+        <button id="layout-board" type="button" role="tab" data-layout="board" aria-selected="true" aria-controls="view-board">看板</button>
+        <button id="layout-split" type="button" role="tab" data-layout="split" aria-selected="false" aria-controls="view-split">清單</button>
+        <button id="layout-segment" type="button" role="tab" data-layout="segment" aria-selected="false" aria-controls="view-segment">分段</button>
+      </div>
+      <div id="view-segments" class="view-segments" role="group" aria-label="檢視" hidden></div>
+      <div id="search-slot-top"></div>
+    </div>
+    <p id="empty" class="empty" hidden>沒有符合條件的事項</p>
+    <div id="view-board" class="board"></div>
+    <div id="view-split" class="split" hidden>
+      <div id="split-list" class="split-list"></div>
+      <div id="split-detail" class="split-detail"></div>
+    </div>
+    <div id="view-segment" class="board board-segment" hidden></div>
+  </div>
+</div>
 
 <dialog id="dlg-issue">
   <form id="form-issue" method="dialog">
