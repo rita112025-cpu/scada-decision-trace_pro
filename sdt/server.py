@@ -115,6 +115,9 @@ def make_handler(app):
             if STATIC_DIR not in target.parents or not target.is_file():
                 return self._json(404, {"errors": ["找不到檔案"]})
             ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+            # Linux 的 mimetypes 常把 .ico 標成 image/vnd.microsoft.icon；分頁圖示要用 image/x-icon。
+            if target.suffix.lower() == ".ico":
+                ctype = "image/x-icon"
             if ctype.startswith("text/") or ctype.endswith("javascript"):
                 ctype += "; charset=utf-8"
             self._send(200, target.read_bytes(), ctype)
