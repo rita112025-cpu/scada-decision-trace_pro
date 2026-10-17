@@ -57,6 +57,21 @@ html[data-theme="light"] {
 }
 
 * { box-sizing: border-box; }
+/* 捲軸預設透明，滑過捲動容器才出現細拇指。標準屬性給 Firefox；webkit 給 Windows 上的 Chromium。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  transition: scrollbar-color .2s;
+}
+*:hover { scrollbar-color: rgba(150, 140, 145, .55) transparent; }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 8px;
+}
+*:hover::-webkit-scrollbar-thumb { background: rgba(150, 140, 145, .55); }
+*::-webkit-scrollbar-button { display: none; }
 [hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
