@@ -35,7 +35,8 @@ html[data-theme="light"] {
   --text: #3a1f2a;
   --muted: #86596b;
   --line: #f0cfda;
-  --accent: oklch(0.48 0.17 358);
+  /* 設計稿是 0.55；淺色欄底上 12px 文字不到 4.5:1，改 0.52 仍是同一粉色。 */
+  --accent: oklch(0.52 0.17 358);
   --accent-fg: #ffffff;
   --sel-bg: #fbdce6;
   --sel-fg: #8e124c;
@@ -56,6 +57,7 @@ html[data-theme="light"] {
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0;
@@ -392,7 +394,7 @@ dialog h3 { margin: 16px 0 0; font-size: 15px; }
 @media (max-width: 860px) {
   body { height: auto; overflow: auto; }
   .workspace { flex-direction: column; overflow: visible; }
-  .sidebar { width: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  .sidebar { width: auto; max-height: 46vh; border-right: 0; border-bottom: 1px solid var(--line); }
   .sidebar-toggle { display: inline-flex; }
   .stage { overflow: visible; min-height: 70vh; }
   .board { flex-direction: column; overflow: visible; }

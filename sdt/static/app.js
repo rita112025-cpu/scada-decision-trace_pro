@@ -146,6 +146,11 @@ function applyStoredLayout() {
     if (saved === "split" || saved === "segment" || saved === "board") layout = saved;
   } catch (e) { layout = "board"; }
   applyLayout(layout);
+  if (window.matchMedia("(max-width: 860px)").matches) {
+    $("#sidebar").classList.add("is-collapsed");
+    $("#btn-sidebar").setAttribute("aria-expanded", "false");
+    $("#btn-sidebar").textContent = "展開篩選";
+  }
 }
 
 async function pendingDraftCount(projects) {
