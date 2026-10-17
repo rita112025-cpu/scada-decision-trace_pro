@@ -1194,7 +1194,9 @@ async function init() {
   try { state.sidebarIcons = localStorage.getItem(ICONS_KEY) === "1"; } catch (e) { state.sidebarIcons = false; }
   applyIconMode(state.sidebarIcons);
   $("#btn-side-icons").addEventListener("click", () => applyIconMode(!state.sidebarIcons));
-  for (const button of document.querySelectorAll("[data-layout]")) {
+  // body 也有 data-layout（給版面 CSS）。若把監聽掛到 body，側欄分區的點擊會冒泡上來，
+  // 重繪整個側欄並把鍵盤焦點打回 body。只綁真正的版面按鈕。
+  for (const button of document.querySelectorAll("button[data-layout]")) {
     button.addEventListener("click", () => {
       applyLayout(button.dataset.layout);
       if (state.items) {
