@@ -1,13 +1,20 @@
 """HTTP 層測試：在隨機埠啟動真實伺服器，經 127.0.0.1 呼叫 API。"""
+import base64
 import http.client
 import json
 import pathlib
+import sqlite3
 import tempfile
 import threading
 import unittest
 import urllib.parse
 
 from sdt import config, server
+
+FICTIONAL_TXT = (
+    "[00:00:01.00\u201300:00:03.00] 決議：虛構刪除測試採用備援盤。\n"
+    "[00:00:04.00\u201300:00:06.00] 待辦：請林示範確認虛構點位。\n"
+)
 
 TODAY = "2026-10-14"
 
@@ -41,6 +48,18 @@ class TestServer(unittest.TestCase):
         status, body = self.req("GET", "/", raw=True)
         self.assertEqual(status, 200)
         self.assertIn("決議".encode("utf-8"), body)
+        self.assertIn(b'<link rel="icon" href="/static/app.ico"', body)
+
+    def test_favicon_is_icon(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/static/app.ico", headers={"Host": f"127.0.0.1:{self.port}"})
+        r = c.getresponse()
+        payload = r.read()
+        ctype = r.getheader("Content-Type")
+        c.close()
+        self.assertEqual(r.status, 200)
+        self.assertEqual(ctype, "image/x-icon")
+        self.assertTrue(payload.startswith(b"\x00\x00\x01\x00"))
 
     def test_create_update_history_flow(self):
         s, r = self.req("POST", "/api/issues", {"title": "HTTP 建立", "source_status": "已確認"})
@@ -136,6 +155,203 @@ class TestServer(unittest.TestCase):
     def test_static_path_traversal_blocked(self):
         s, _ = self.req("GET", "/static/../server.py", raw=True)
         self.assertEqual(s, 404)
+
+    def _import_fictional(self):
+        source = pathlib.Path(self.tmp.name) / "do-not-touch.txt"
+        source.write_text("虛構原始檔不該被刪\n", encoding="utf-8")
+        status, proj = self.req("POST", "/api/projects", {"name": "虛構刪除專案"})
+        self.assertEqual(status, 201)
+        status, imported = self.req("POST", "/api/transcripts/import", {
+            "project_id": proj["project"]["project_id"],
+            "filename": "fictional-delete.txt",
+            "content_base64": base64.b64encode(FICTIONAL_TXT.encode("utf-8")).decode("ascii"),
+            "confirm": True,
+        })
+        self.assertEqual(status, 200, imported)
+        self.assertTrue(imported["created"])
+        return proj["project"]["project_id"], imported["transcript_id"], source
+
+    def _drafts(self, project_id, transcript_id):
+        status, data = self.req(
+            "GET", "/api/drafts?" + urllib.parse.urlencode({
+                "project_id": project_id, "transcript_id": transcript_id, "status": "",
+            }))
+        self.assertEqual(status, 200)
+        return data["items"]
+
+    def test_delete_transcript_removes_only_unconfirmed_rows(self):
+        project_id, tid, source = self._import_fictional()
+        drafts = self._drafts(project_id, tid)
+        self.assertGreaterEqual(len(drafts), 2)
+        kept = source.read_text(encoding="utf-8")
+        status, preview = self.req("POST", f"/api/transcripts/{tid}/delete", {"preview": True})
+        self.assertEqual(status, 200)
+        self.assertFalse(preview["deleted"])
+        self.assertEqual(preview["confirmed_count"], 0)
+        self.assertGreater(preview["segment_count"], 0)
+        status, held = self.req("POST", f"/api/transcripts/{tid}/delete", {})
+        self.assertEqual(status, 200)
+        self.assertFalse(held["deleted"])
+        status, blocked = self.req(
+            "POST", f"/api/transcripts/{tid}/delete", {"confirm": True}, headers={"X-SDT": ""})
+        self.assertEqual(status, 403)
+        self.assertTrue(blocked["errors"])
+        self.assertEqual(source.read_text(encoding="utf-8"), kept)
+        status, gone = self.req("POST", f"/api/transcripts/{tid}/delete", {"confirm": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(gone["deleted"])
+        self.assertIn("沒有刪除台帳", gone["message"])
+        status, missing = self.req("GET", f"/api/transcripts/{tid}")
+        self.assertEqual(status, 404)
+        self.assertEqual(self._drafts(project_id, tid), [])
+        status, issues = self.req("GET", "/api/issues")
+        self.assertEqual(issues["items"], [])
+        self.assertEqual(source.read_text(encoding="utf-8"), kept)
+
+    def test_confirmed_transcript_requires_explicit_detach(self):
+        project_id, tid, source = self._import_fictional()
+        drafts = self._drafts(project_id, tid)
+        decision = next(d for d in drafts if d["kind"] == "決議")
+        other = next(d for d in drafts if d["draft_id"] != decision["draft_id"])
+        status, confirmed = self.req("POST", f"/api/drafts/{decision['draft_id']}/confirm", {})
+        self.assertEqual(status, 200)
+        issue_id = confirmed["issue"]["issue_id"]
+        quote = confirmed["issue"]["source_quote"]
+        status, denied = self.req("POST", f"/api/transcripts/{tid}/delete", {"confirm": True})
+        self.assertEqual(status, 409)
+        self.assertFalse(denied["deleted"])
+        self.assertEqual(denied["issue_ids"], [issue_id])
+        self.assertGreaterEqual(denied["confirmed_count"], 1)
+        status, issue = self.req("GET", f"/api/issues/{issue_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(issue["transcript_id"], tid)
+        status, blocked = self.req(
+            "POST", f"/api/transcripts/{tid}/delete", {"confirm": True, "ledger": "block"})
+        self.assertEqual(status, 200)
+        self.assertFalse(blocked["deleted"])
+        self.assertEqual(self.req("GET", f"/api/transcripts/{tid}")[0], 200)
+        status, detached = self.req(
+            "POST", f"/api/transcripts/{tid}/delete", {"confirm": True, "ledger": "detach"})
+        self.assertEqual(status, 200, detached)
+        self.assertTrue(detached["deleted"])
+        self.assertEqual(self.req("GET", f"/api/transcripts/{tid}")[0], 404)
+        self.assertEqual(self._drafts(project_id, tid), [])
+        status, issue = self.req("GET", f"/api/issues/{issue_id}")
+        self.assertEqual(issue["transcript_id"], "")
+        self.assertEqual(issue["segment_ref"], "")
+        self.assertEqual(issue["draft_id"], "")
+        self.assertEqual(issue["source_quote"], quote)
+        self.assertFalse(issue["project_locked"])
+        self.assertEqual(source.read_text(encoding="utf-8"), "虛構原始檔不該被刪\n")
+        self.assertNotEqual(other["draft_id"], decision["draft_id"])
+
+    def test_delete_draft_does_not_keep_discard_row(self):
+        project_id, tid, source = self._import_fictional()
+        drafts = self._drafts(project_id, tid)
+        first, second = drafts[0], drafts[1]
+        status, discarded = self.req("POST", f"/api/drafts/{first['draft_id']}/discard", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(discarded["draft"]["review_status"], "已捨棄")
+        status, denied = self.req("POST", f"/api/drafts/{second['draft_id']}/delete", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            self.req("GET", f"/api/drafts/{second['draft_id']}")[1]["review_status"], "草稿")
+        status, blocked = self.req(
+            "POST", f"/api/drafts/{second['draft_id']}/delete", {"confirm": True}, headers={"X-SDT": ""})
+        self.assertEqual(status, 403)
+        self.assertTrue(blocked["errors"])
+        status, removed = self.req(
+            "POST", f"/api/drafts/{second['draft_id']}/delete", {"confirm": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(removed["deleted"])
+        self.assertIn("沒有留下捨棄紀錄", removed["message"])
+        self.assertEqual(self.req("GET", f"/api/drafts/{second['draft_id']}")[0], 404)
+        self.assertEqual(self.req("GET", f"/api/drafts/{first['draft_id']}")[1]["review_status"], "已捨棄")
+        status, removed_discarded = self.req(
+            "POST", f"/api/drafts/{first['draft_id']}/delete", {"confirm": True})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.req("GET", f"/api/drafts/{first['draft_id']}")[0], 404)
+        status, issues = self.req("GET", "/api/issues")
+        self.assertEqual(issues["items"], [])
+        self.assertEqual(source.read_text(encoding="utf-8"), "虛構原始檔不該被刪\n")
+        status, confirmed = self.req("POST", "/api/transcripts/import", {
+            "project_id": project_id,
+            "filename": "fictional-delete-again.txt",
+            "content_base64": base64.b64encode(FICTIONAL_TXT.replace("備援盤", "另一盤").encode("utf-8")).decode("ascii"),
+            "confirm": True,
+        })
+        self.assertEqual(status, 200)
+        again = self._drafts(project_id, confirmed["transcript_id"])
+        posted = self.req("POST", f"/api/drafts/{again[0]['draft_id']}/confirm", {})[1]
+        status, refused = self.req(
+            "POST", f"/api/drafts/{again[0]['draft_id']}/delete", {"confirm": True})
+        self.assertEqual(status, 400)
+        self.assertTrue(any("不會默默刪除" in err for err in refused["errors"]))
+        self.assertEqual(self.req("GET", f"/api/issues/{posted['issue']['issue_id']}")[0], 200)
+        self.assertEqual(
+            self.req("GET", f"/api/drafts/{again[0]['draft_id']}")[1]["review_status"], "已確認")
+
+    def test_delete_issue_stays_in_history_and_reverts_draft(self):
+        project_id, tid, source = self._import_fictional()
+        draft = self._drafts(project_id, tid)[0]
+        status, confirmed = self.req("POST", f"/api/drafts/{draft['draft_id']}/confirm", {})
+        issue_id = confirmed["issue"]["issue_id"]
+        status, linked = self.req("POST", f"/api/issues/{issue_id}/links", {"hit": {
+            "notebook": "虛構筆記", "source_id": "9", "chunk_id": "9",
+            "filename": "fictional-note.txt", "snippet": "只是連結",
+        }})
+        self.assertEqual(status, 201)
+        status, early = self.req("POST", f"/api/issues/{issue_id}/delete", {})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.req("GET", f"/api/issues/{issue_id}")[0], 200)
+        status, blocked = self.req(
+            "POST", f"/api/issues/{issue_id}/delete", {"confirm": True}, headers={"X-SDT": ""})
+        self.assertEqual(status, 403)
+        self.assertTrue(blocked["errors"])
+        status, removed = self.req("POST", f"/api/issues/{issue_id}/delete", {"confirm": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(removed["draft_reverted"])
+        self.assertEqual(removed["links_removed"], 1)
+        self.assertEqual(self.req("GET", f"/api/issues/{issue_id}")[0], 404)
+        self.assertEqual(self.req("GET", f"/api/issues/{issue_id}/links")[0], 404)
+        self.assertEqual(self.req("GET", f"/api/drafts/{draft['draft_id']}")[1]["review_status"], "草稿")
+        self.assertEqual(self.req("GET", f"/api/drafts/{draft['draft_id']}")[1]["issue_id"], "")
+        status, csv_body = self.req("GET", "/api/history.csv", raw=True)
+        text = csv_body.decode("utf-8-sig")
+        self.assertIn(issue_id, text)
+        self.assertIn("delete", text)
+        self.assertEqual(source.read_text(encoding="utf-8"), "虛構原始檔不該被刪\n")
+
+    def test_wipe_all_backs_up_first_and_leaves_source_file(self):
+        project_id, tid, source = self._import_fictional()
+        self.req("POST", f"/api/drafts/{self._drafts(project_id, tid)[0]['draft_id']}/confirm", {})
+        before = source.read_text(encoding="utf-8")
+        status, denied = self.req("POST", "/api/data/clear", {"confirm": "不是"})
+        self.assertEqual(status, 400)
+        self.assertEqual(self.req("GET", f"/api/transcripts/{tid}")[0], 200)
+        self.assertFalse(list(pathlib.Path(self.tmp.name, "backups").glob("sdt-pre-clear-all-*")))
+        status, blocked = self.req("POST", "/api/data/clear", {"confirm": server.CLEAR_ALL_PHRASE}, headers={"X-SDT": ""})
+        self.assertEqual(status, 403)
+        self.assertTrue(blocked["errors"])
+        self.assertEqual(self.req("GET", "/api/issues")[1]["counts"]["all"], 1)
+        status, cleared = self.req("POST", "/api/data/clear", {"confirm": server.CLEAR_ALL_PHRASE})
+        self.assertEqual(status, 200)
+        self.assertTrue(cleared["backup"].startswith("sdt-pre-clear-all-"))
+        self.assertEqual(self.req("GET", "/api/issues")[1]["items"], [])
+        self.assertEqual(self.req("GET", "/api/projects")[1]["items"], [])
+        self.assertEqual(self.req("GET", f"/api/transcripts/{tid}")[0], 404)
+        self.assertEqual(source.read_text(encoding="utf-8"), before)
+        backup = pathlib.Path(self.tmp.name, "backups", cleared["backup"])
+        self.assertTrue(backup.is_file())
+        conn = sqlite3.connect(backup)
+        try:
+            stored = conn.execute("SELECT COUNT(*) FROM issues").fetchone()[0]
+            transcripts = conn.execute("SELECT COUNT(*) FROM transcripts").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(stored, 1)
+        self.assertEqual(transcripts, 1)
+        self.assertTrue(backup.is_file())
 
 
 if __name__ == "__main__":

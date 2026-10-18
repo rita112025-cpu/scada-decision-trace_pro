@@ -4,62 +4,94 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>決議追蹤器</title>
+<link rel="icon" href="/static/app.ico" sizes="any">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header class="top">
-  <div>
+  <div class="brand">
     <h1>SCADA 決議—模型—圖紙追蹤器</h1>
-    <p class="sub">本機資料 · 操作者：<span id="operator">-</span> · 今天：<span id="today">-</span></p>
+    <p class="sub">本機資料 · 操作者:<span id="operator">-</span> · 今天:<span id="today">-</span></p>
   </div>
   <div class="actions">
-    <button id="btn-new" class="primary">＋ 新增事項</button>
-    <button id="btn-import">匯入逐字稿</button>
-    <button id="btn-drafts">審核草稿</button>
-    <button id="btn-project">專案名稱</button>
-    <button id="btn-agenda">議程草稿</button>
-    <a id="btn-export" class="btn" href="/api/export.csv">匯出 CSV</a>
-    <a class="btn" href="/api/history.csv">匯出變更紀錄</a>
+    <button id="btn-new" class="primary" type="button">＋ 新增事項</button>
+    <button id="btn-import" type="button">匯入逐字稿</button>
+    <button id="btn-drafts" type="button">審核草稿 <span id="draft-count">0</span></button>
     <label class="btn">匯入 CSV<input id="file-import" type="file" accept=".csv,text/csv" hidden></label>
-    <button id="btn-backup">備份</button>
-    <button id="btn-sample-load">載入範例</button>
-    <button id="btn-sample-clear" class="danger">清除範例</button>
+    <a id="btn-export" class="btn" href="/api/export.csv">匯出 CSV</a>
+    <details class="more" id="more-menu">
+      <summary>更多 ▾</summary>
+      <div class="more-panel">
+        <button id="btn-project" type="button">專案名稱</button>
+        <button id="btn-agenda" type="button">議程草稿</button>
+        <a class="btn" href="/api/history.csv">匯出變更紀錄</a>
+        <button id="btn-backup" type="button">備份</button>
+        <button id="btn-sample-load" type="button">載入範例</button>
+        <button id="btn-sample-clear" class="danger" type="button">清除範例</button>
+        <button id="btn-wipe" class="danger" type="button">清空全部資料</button>
+        <button type="button" class="layout-more" data-layout="board">看板</button>
+        <button type="button" class="layout-more" data-layout="split">清單</button>
+        <button type="button" class="layout-more" data-layout="segment">分段</button>
+        <details class="advanced">
+          <summary>排序與其他篩選</summary>
+          <label>類型<select id="f-issue_type"><option value="">全部類型</option></select></label>
+          <label>負責人<input id="f-owner" type="text" placeholder="負責人" aria-label="負責人"></label>
+          <label>排序<select id="f-sort" aria-label="排序">
+            <option value="due_date">依期限</option>
+            <option value="priority">依優先級</option>
+            <option value="updated_at">依更新時間</option>
+            <option value="issue_id">依編號</option>
+            <option value="status">依狀態</option>
+            <option value="owner">依負責人</option>
+          </select></label>
+          <label>順序<select id="f-order" aria-label="順序"><option value="asc">升冪</option><option value="desc">降冪</option></select></label>
+        </details>
+      </div>
+    </details>
+    <button id="btn-theme" class="theme-toggle" type="button" aria-pressed="true">☀ 切換為淺粉</button>
   </div>
 </header>
 
-<div id="msg" class="msg" hidden></div>
+<div id="msg" class="msg" role="status" hidden></div>
 
-<nav class="tabs" id="tabs"></nav>
-
-<section class="filters">
-  <input id="f-q" type="search" placeholder="搜尋編號、標題、描述、來源、圖號、模型…">
-  <select id="f-project"><option value="">全部專案</option></select>
-  <select id="f-issue_type"><option value="">全部類型</option></select>
-  <select id="f-status"><option value="">全部狀態</option></select>
-  <select id="f-priority"><option value="">全部優先級</option></select>
-  <select id="f-source_status"><option value="">全部來源狀態</option></select>
-  <input id="f-owner" type="text" placeholder="負責人">
-  <select id="f-sort">
-    <option value="due_date">依期限</option>
-    <option value="priority">依優先級</option>
-    <option value="updated_at">依更新時間</option>
-    <option value="issue_id">依編號</option>
-    <option value="status">依狀態</option>
-    <option value="owner">依負責人</option>
-  </select>
-  <select id="f-order"><option value="asc">升冪</option><option value="desc">降冪</option></select>
-</section>
-
-<main>
-  <table class="grid">
-    <thead><tr>
-      <th>編號</th><th>專案</th><th>類型</th><th>標題</th><th>負責人</th><th>期限</th><th>優先</th>
-      <th>狀態</th><th>來源狀態</th><th>圖號／版次</th><th>模型／元素</th>
-    </tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <p id="empty" class="empty" hidden>沒有符合條件的事項</p>
-</main>
+<div class="workspace">
+  <aside class="sidebar" id="sidebar">
+    <button id="btn-sidebar" class="sidebar-toggle" type="button" aria-expanded="true" aria-controls="side-body">收合篩選</button>
+    <div id="side-body">
+      <div id="search-slot-side">
+        <input id="f-q" type="search" placeholder="搜尋編號、標題、圖號、模型…" aria-label="搜尋編號、標題、描述、來源、圖號或模型">
+      </div>
+      <nav id="side-filters" class="side-filters" aria-label="篩選"></nav>
+      <select id="f-project" hidden aria-hidden="true"><option value="">全部專案</option></select>
+      <select id="f-status" hidden aria-hidden="true"><option value="">全部狀態</option></select>
+      <select id="f-priority" hidden aria-hidden="true"><option value="">全部優先級</option></select>
+      <select id="f-source_status" hidden aria-hidden="true"><option value="">全部來源狀態</option></select>
+    </div>
+    <button id="btn-side-icons" class="side-icons-toggle" type="button" aria-pressed="false" aria-label="收合為圖示">
+      <svg class="side-ico" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+        <path d="M2.5 3.5h11v9h-11zM6 3.5v9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>
+      </svg>
+    </button>
+  </aside>
+  <div class="stage">
+    <div class="stage-bar">
+      <div class="layout-switch" role="tablist" aria-label="畫面">
+        <button id="layout-board" type="button" role="tab" data-layout="board" aria-selected="true" aria-controls="view-board">看板</button>
+        <button id="layout-split" type="button" role="tab" data-layout="split" aria-selected="false" aria-controls="view-split">清單</button>
+        <button id="layout-segment" type="button" role="tab" data-layout="segment" aria-selected="false" aria-controls="view-segment">分段</button>
+      </div>
+      <div id="view-segments" class="view-segments" role="group" aria-label="檢視" hidden></div>
+      <div id="search-slot-top"></div>
+    </div>
+    <p id="empty" class="empty" hidden>沒有符合條件的事項</p>
+    <div id="view-board" class="board"></div>
+    <div id="view-split" class="split" hidden>
+      <div id="split-list" class="split-list"></div>
+      <div id="split-detail" class="split-detail"></div>
+    </div>
+    <div id="view-segment" class="board board-segment" hidden></div>
+  </div>
+</div>
 
 <dialog id="dlg-issue">
   <form id="form-issue" method="dialog">
@@ -68,6 +100,7 @@
     <div id="form-fields" class="form-grid"></div>
     <div id="form-errors" class="msg error" hidden></div>
     <div class="dlg-actions">
+      <button type="button" id="btn-delete-issue" class="danger" hidden>刪除事項</button>
       <button type="button" id="btn-cancel">取消</button>
       <button type="submit" class="primary">儲存</button>
     </div>
@@ -119,6 +152,30 @@
     <label class="wide">檔案<input id="import-file" type="file" accept=".json,.txt,application/json,text/plain"></label>
   </div>
   <pre id="import-preview" class="quote" hidden></pre>
+  <section>
+    <h3>已匯入的逐字稿</h3>
+    <p class="hint">重新解析時間與重新抽取候選是兩個動作，各自預覽、各自套用。都不會自動確認入帳。刪除只拿掉這份匯入與未入帳草稿，不會刪磁碟上的原始 TXT；已入帳事項不會被默默刪掉。</p>
+    <select id="reparse-transcript"></select>
+    <div id="transcript-list" class="stack"></div>
+  </section>
+  <section>
+    <h3>重新解析時間</h3>
+    <p class="hint">只更新對得上的行的時間與抽取用正文。原始行、草稿審核狀態、已入帳事項與原始引用都保留。不會產生新草稿。</p>
+    <div class="filters">
+      <button type="button" id="btn-reparse-preview">預覽重新解析</button>
+      <button type="button" id="btn-reparse-apply">套用重新解析</button>
+    </div>
+    <pre id="reparse-preview" class="quote" hidden></pre>
+  </section>
+  <section>
+    <h3>重新抽取候選</h3>
+    <p class="hint">依 rule:v5 預覽會新增的候選。明文標記沿用舊規則；口語說法會標出對上的說法與信心，仍是草稿。「麻煩」要有對象和動作，談預算或「但是麻煩」不收。「你們先／你先」接到確認、看看、改、出圖這類動作會列為草稿；報價、問句、「你們先不用」和「你們先前」不收。套用時只補來源位置還沒有的草稿，不覆寫既有摘要、原文、審核狀態或已入帳事項。相同句子在不同段落會各自保留。舊原文若帶時間前綴，依來源位置對上且不改原句；對不到唯一位置的標成待核對，不新增草稿。</p>
+    <div class="filters">
+      <button type="button" id="btn-reextract-preview">預覽重新抽取</button>
+      <button type="button" id="btn-reextract-apply">套用重新抽取</button>
+    </div>
+    <pre id="reextract-preview" class="quote" hidden></pre>
+  </section>
   <div id="import-errors" class="msg error" hidden></div>
   <div class="dlg-actions">
     <button type="button" id="btn-import-close">關閉</button>
@@ -129,7 +186,7 @@
 
 <dialog id="dlg-drafts">
   <h2>審核草稿</h2>
-  <p class="hint">只有按下「確認入帳」的草稿會進入正式台帳。捨棄或尚未確認的草稿不會出現在事項列表。</p>
+  <p class="hint">只有按下「確認入帳」的草稿會進入正式台帳。捨棄會留下這筆紀錄；刪除則直接拿掉草稿，不留捨棄紀錄，也不會刪台帳。</p>
   <div class="filters">
     <select id="draft-project"></select>
     <select id="draft-status">
@@ -155,6 +212,25 @@
   <div class="dlg-actions">
     <button type="button" id="btn-rename-close">關閉</button>
     <button type="button" id="btn-rename-save" class="primary">儲存名稱</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-delete">
+  <h2 id="delete-title">確認刪除</h2>
+  <pre id="delete-body" class="quote"></pre>
+  <div id="delete-actions" class="dlg-actions"></div>
+</dialog>
+
+<dialog id="dlg-wipe">
+  <h2>清空全部資料</h2>
+  <p class="hint">會先自動備份，再刪除台帳、變更紀錄、逐字稿、草稿與專案。不會刪磁碟上的原始 TXT，也不會刪已經做好的備份檔。</p>
+  <div class="form-grid">
+    <label>請輸入確認詞<input id="wipe-confirm" type="text" autocomplete="off" maxlength="20"></label>
+  </div>
+  <div id="wipe-errors" class="msg error" hidden></div>
+  <div class="dlg-actions">
+    <button type="button" id="btn-wipe-cancel">取消</button>
+    <button type="button" id="btn-wipe-go" class="danger" disabled>清空全部資料</button>
   </div>
 </dialog>
 
