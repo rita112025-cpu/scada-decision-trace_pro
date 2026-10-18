@@ -15,6 +15,7 @@
   </div>
   <div class="actions">
     <button id="btn-new" class="primary" type="button">＋ 新增事項</button>
+    <button id="btn-transcripts" type="button">已匯入逐字稿</button>
     <button id="btn-import" type="button">匯入逐字稿</button>
     <button id="btn-drafts" type="button">審核草稿 <span id="draft-count">0</span></button>
     <label class="btn">匯入 CSV<input id="file-import" type="file" accept=".csv,text/csv" hidden></label>
@@ -31,7 +32,7 @@
         <button id="btn-wipe" class="danger" type="button">清空全部資料</button>
         <button type="button" class="layout-more" data-layout="board">看板</button>
         <button type="button" class="layout-more" data-layout="split">清單</button>
-        <button type="button" class="layout-more" data-layout="segment">分段</button>
+        <button type="button" class="layout-more" data-layout="segment">依狀態分組</button>
         <details class="advanced">
           <summary>排序與其他篩選</summary>
           <label>類型<select id="f-issue_type"><option value="">全部類型</option></select></label>
@@ -78,12 +79,20 @@
       <div class="layout-switch" role="tablist" aria-label="畫面">
         <button id="layout-board" type="button" role="tab" data-layout="board" aria-selected="true" aria-controls="view-board">看板</button>
         <button id="layout-split" type="button" role="tab" data-layout="split" aria-selected="false" aria-controls="view-split">清單</button>
-        <button id="layout-segment" type="button" role="tab" data-layout="segment" aria-selected="false" aria-controls="view-segment">分段</button>
+        <button id="layout-segment" type="button" role="tab" data-layout="segment" aria-selected="false" aria-controls="view-segment">依狀態分組</button>
       </div>
-      <div id="view-segments" class="view-segments" role="group" aria-label="檢視" hidden></div>
+      <div id="view-segments" class="view-segments" role="group" aria-label="快捷篩選" hidden></div>
       <div id="search-slot-top"></div>
     </div>
-    <p id="empty" class="empty" hidden>沒有符合條件的事項</p>
+    <p id="result-count" class="result-count" aria-live="polite"></p>
+    <div id="empty" class="empty" hidden>
+      <p id="empty-text"></p>
+      <div class="empty-actions">
+        <button id="btn-empty-new" class="primary" type="button">＋ 新增事項</button>
+        <button id="btn-empty-import" type="button">匯入逐字稿</button>
+        <button id="btn-empty-clear" type="button" hidden>清除篩選</button>
+      </div>
+    </div>
     <div id="view-board" class="board"></div>
     <div id="view-split" class="split" hidden>
       <div id="split-list" class="split-list"></div>
@@ -182,6 +191,17 @@
     <button type="button" id="btn-import-preview">預覽</button>
     <button type="button" id="btn-import-confirm" class="primary">確認匯入</button>
   </div>
+</dialog>
+
+<dialog id="dlg-transcripts">
+  <h2>已匯入逐字稿</h2>
+  <p class="hint">按專案管理本機已匯入的逐字稿。刪除前會列出受影響數量，不會刪磁碟上的原始檔。</p>
+  <div class="filters">
+    <label>專案<select id="tr-project"></select></label>
+    <button type="button" id="btn-tr-reload">重新整理</button>
+  </div>
+  <div id="tr-list" class="stack scroll"></div>
+  <div class="dlg-actions"><button type="button" id="btn-tr-close" class="primary">關閉</button></div>
 </dialog>
 
 <dialog id="dlg-drafts">

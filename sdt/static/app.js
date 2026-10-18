@@ -313,7 +313,7 @@ function renderSidebar() {
   const viewOpts = META.views.map((v) => ({
     value: v, label: VIEW_LABELS[v], count: counts[v] ?? 0, on: state.view === v,
   }));
-  nav.append(sideGroup("view", "檢視", viewOpts, (opt) => {
+  nav.append(sideGroup("view", "快捷篩選", viewOpts, (opt) => {
     if (state.view === opt.value) return;
     state.view = opt.value;
     refresh().catch((e) => showMsg(e.message, "error"));
@@ -619,6 +619,34 @@ async function changeStatus(id, status) {
   }
 }
 
+const FILTER_IDS = ["f-q", "f-issue_type", "f-owner", "f-project", "f-status", "f-priority", "f-source_status"];
+
+function hasActiveFilter() {
+  return state.view !== "all" || FILTER_IDS.some((id) => $("#" + id).value.trim() !== "");
+}
+
+function clearFilters() {
+  for (const id of FILTER_IDS) $("#" + id).value = "";
+  state.view = "all";
+  refresh().catch((e) => showMsg(e.message, "error"));
+}
+
+function renderResultState() {
+  const total = state.counts?.all ?? 0;
+  const shown = state.items.length;
+  $("#result-count").textContent = `共 ${total} 筆／目前顯示 ${shown} 筆`;
+  const empty = $("#empty");
+  empty.hidden = shown > 0;
+  if (shown > 0) return;
+  const filtered = hasActiveFilter();
+  $("#empty-text").textContent = filtered
+    ? "沒有符合目前篩選的事項。可以清除篩選後再看。"
+    : "尚無事項。新增事項，或匯入逐字稿後審核入帳。";
+  $("#btn-empty-clear").hidden = !filtered;
+  $("#btn-empty-new").hidden = filtered;
+  $("#btn-empty-import").hidden = filtered;
+}
+
 function paint() {
   const remember = ["#view-board", "#view-segment", "#split-list", "#side-body"];
   const saved = new Map();
@@ -635,7 +663,7 @@ function paint() {
   renderBoard($("#view-board"), false);
   renderBoard($("#view-segment"), true);
   renderSplit();
-  $("#empty").hidden = state.items.length > 0;
+  renderResultState();
   for (const [sel, pos] of saved) {
     const node = $(sel);
     node.scrollTop = pos.top;
@@ -1113,6 +1141,37 @@ async function confirmImport() {
   }
 }
 
+async function loadTranscriptList() {
+  const list = $("#tr-list");
+  const projectId = $("#tr-project").value;
+  list.replaceChildren();
+  if (!projectId) {
+    list.append(el("p", "還沒有專案。", "hint"));
+    return;
+  }
+  const data = await api("/api/transcripts?" + new URLSearchParams({ project_id: projectId }));
+  for (const item of data.items) {
+    const card = el("article", "", "card");
+    card.append(el("p", item.filename, "tr-name"));
+    card.append(el("p", `${item.transcript_id}　${item.segment_count} 段　匯入於 ${item.imported_at}`, "hint"));
+    const actions = el("div", "", "row-actions");
+    const remove = el("button", "刪除", "danger");
+    remove.type = "button";
+    remove.addEventListener("click", () => deleteTranscript(item.transcript_id).catch((e) => showMsg(e.message, "error")));
+    actions.append(remove);
+    card.append(actions);
+    list.append(card);
+  }
+  if (!data.items.length) list.append(el("p", "此專案尚未匯入逐字稿。", "hint"));
+}
+
+async function openTranscripts() {
+  state.projects = (await api("/api/projects")).items;
+  fillProjectSelect($("#tr-project"), { selected: $("#f-project").value });
+  $("#dlg-transcripts").showModal();
+  await loadTranscriptList();
+}
+
 async function openDrafts() {
   state.projects = (await api("/api/projects")).items;
   fillProjectSelect($("#draft-project"), { selected: $("#f-project").value });
@@ -1239,10 +1298,8 @@ async function deleteTranscript(id) {
   const plan = await api(`/api/transcripts/${encodeURIComponent(id)}/delete`, {
     method: "POST", json: { preview: true },
   });
-  const lines = [
-    plan.message,
-    "不會刪磁碟上的原始 TXT。",
-  ];
+  const lines = [plan.message];
+  if (!plan.message.includes("原始 TXT")) lines.push("不會刪磁碟上的原始 TXT。");
   const buttons = [{ label: "取消，不刪除", onClick: () => {} }];
   if (plan.confirmed_count || (plan.issue_ids || []).length) {
     buttons.push({
@@ -1265,7 +1322,8 @@ async function applyDeleteTranscript(id, ledger) {
   if (ledger) body.ledger = ledger;
   const res = await api(`/api/transcripts/${encodeURIComponent(id)}/delete`, { method: "POST", json: body });
   showMsg(res.message, res.deleted ? "" : "warn");
-  await loadReparseTranscripts();
+  if ($("#dlg-transcripts").open) await loadTranscriptList();
+  if ($("#dlg-import").open) await loadReparseTranscripts();
   await refresh();
 }
 
@@ -1431,6 +1489,9 @@ async function init() {
   }
 
   $("#btn-new").addEventListener("click", openNew);
+  $("#btn-empty-new").addEventListener("click", openNew);
+  $("#btn-empty-import").addEventListener("click", () => $("#btn-import").click());
+  $("#btn-empty-clear").addEventListener("click", clearFilters);
   $("#form-issue").addEventListener("submit", saveIssue);
   $("#btn-cancel").addEventListener("click", () => $("#dlg-issue").close());
   $("#btn-origin").addEventListener("click", () => showSourceSegment().catch((e) => showMsg(e.message, "error")));
@@ -1481,6 +1542,10 @@ async function init() {
   $("#btn-import-confirm").addEventListener("click", () => confirmImport());
   $("#import-file").addEventListener("change", (ev) => { state.importFile = ev.target.files[0] || null; });
   $("#btn-drafts").addEventListener("click", () => openDrafts().catch((e) => showMsg(e.message, "error")));
+  $("#btn-transcripts").addEventListener("click", () => openTranscripts().catch((e) => showMsg(e.message, "error")));
+  $("#tr-project").addEventListener("change", () => loadTranscriptList().catch((e) => showMsg(e.message, "error")));
+  $("#btn-tr-reload").addEventListener("click", () => loadTranscriptList().catch((e) => showMsg(e.message, "error")));
+  $("#btn-tr-close").addEventListener("click", () => $("#dlg-transcripts").close());
   $("#btn-draft-close").addEventListener("click", () => $("#dlg-drafts").close());
   $("#btn-draft-reload").addEventListener("click", () => reloadDrafts().catch((e) => showMsg(e.message, "error")));
   $("#draft-project").addEventListener("change", () => reloadDrafts().catch((e) => showMsg(e.message, "error")));
