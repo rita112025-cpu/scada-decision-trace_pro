@@ -24,6 +24,9 @@ let refreshVersion = 0;
 let transcriptListVersion = 0;
 /** @type {{transcript_id: string, preview_token: string} | null} */
 let transcriptDeletion = null;
+let meetingResultMarkdown = "";
+let meetingResultTranscript = "";
+let meetingResultId = "";
 let state = {
   view: "all", editing: null, editingIssue: null, projects: [], importFile: null,
   layout: "board", expanded: null, selected: null, items: [], facetItems: [], counts: {}, total: 0,
@@ -771,6 +774,7 @@ function openNew() {
   $("#history-wrap").hidden = true;
   $("#origin-wrap").hidden = true;
   $("#doc-wrap").hidden = true;
+  $("#btn-delete-issue").hidden = true;
   $("#dlg-issue").showModal();
 }
 
@@ -821,7 +825,20 @@ async function openIssue(id) {
   $("#doc-msg").textContent = "";
   await loadDocLinks(id);
   loadNotebooks().catch((e) => { $("#doc-msg").textContent = e.message; });
+  $("#btn-delete-issue").hidden = false;
   $("#dlg-issue").showModal();
+}
+
+async function deleteIssue(id) {
+  if (!confirm(`刪除事項 ${id}？\n變更紀錄會留下這次刪除。文件關聯只移除資料庫裡的連結，不會刪磁碟上的檔案。若此事項來自草稿，該草稿會回到未入帳。`)) return;
+  try {
+    const res = await api(`/api/issues/${encodeURIComponent(id)}/delete`, { method: "POST", json: { confirm: true } });
+    $("#dlg-issue").close();
+    showMsg(res.message);
+    await refresh();
+  } catch (e) {
+    showMsg(e.message, "error");
+  }
 }
 
 async function saveIssue(ev) {
@@ -1018,6 +1035,11 @@ async function previewImport() {
       `段落數：${res.segment_count}`,
       `時間資訊：${res.timestamp_status}`,
       res.timestamp_detail,
+      ...(res.diagnostics ? [
+        `來源音檔：${res.diagnostics.source_audio_count}；時間成功：${res.diagnostics.time.timed}；無時間：${res.diagnostics.time.no_time}；解析失敗：${res.diagnostics.time.failed}`,
+        `抽取器：${res.diagnostics.extractor}；執行方式：${res.diagnostics.run_mode}；本次沒有執行語意整理。`,
+        ...res.diagnostics.warnings,
+      ] : []),
       res.duplicate ? `相同內容已存在：${res.existing_transcript_id}，確認匯入不會重複建立。` : "尚未匯入過這份內容。",
       ...res.notes,
     ];
@@ -1040,6 +1062,7 @@ async function confirmImport() {
     showMsg(res.message, res.duplicate ? "warn" : "");
     $("#dlg-import").close();
     await refresh();
+    if (res.transcript_id) await openMeetingResults(res.transcript_id);
   } catch (e) {
     box.textContent = e.message;
     box.hidden = false;
@@ -1078,6 +1101,10 @@ async function reloadTranscripts() {
       const info = el("div", "", "transcript-info");
       info.append(el("div", item.filename, "transcript-filename"),
         el("p", `匯入時間：${item.imported_at}`, "hint"));
+      const resultButton = el("button", "會議成果與診斷");
+      resultButton.type = "button";
+      resultButton.addEventListener("click", () => openMeetingResults(item.transcript_id)
+        .catch((e) => { errors.textContent = e.message; errors.hidden = false; }));
       const button = el("button", "刪除", "danger");
       button.type = "button";
       button.setAttribute("aria-label", "刪除逐字稿：" + item.filename);
@@ -1092,7 +1119,7 @@ async function reloadTranscripts() {
           button.disabled = false;
         }
       });
-      row.append(info, button);
+      row.append(info, resultButton, button);
       box.append(row);
     }
   } catch (e) {
@@ -1101,6 +1128,108 @@ async function reloadTranscripts() {
     errors.textContent = e.message;
     errors.hidden = false;
   }
+}
+
+async function openMeetingResults(transcriptId) {
+  const data = await api(`/api/transcripts/${encodeURIComponent(transcriptId)}/meeting-results`);
+  meetingResultMarkdown = data.markdown;
+  meetingResultId = transcriptId;
+  meetingResultTranscript = data.transcript.filename;
+  const d = data.diagnostics;
+  const lines = [
+    `來源音檔 ${d.source_audio_count} 個；段落 ${d.segment_count} 段`,
+    `時間解析：成功 ${d.time.timed}、無時間 ${d.time.no_time}、失敗 ${d.time.failed}`,
+    `候選 ${d.candidate_count} 筆；待審核 ${d.pending_review}；已入帳 ${d.posted}`,
+    `範圍：${d.coverage}`, `解析器：${d.parser}；抽取器：${d.extractor}（${d.run_mode}）`,
+  ];
+  $("#meeting-results-mode").textContent = d.machine_transcript_unreviewed
+    ? `規則候選預覽；未完成語意整理。${d.transcript_notice} 原文與音檔核對狀態分開管理。`
+    : "規則候選預覽；未完成語意整理。候選不等於已查證決議。原文與音檔核對狀態分開管理。";
+  $("#meeting-results-diagnostics").replaceChildren(...lines.map((line) => el("p", line, "hint")));
+  $("#meeting-no-decision").hidden = !data.no_confirmed_decision;
+  const quality = data.quality_preview;
+  const reparsed = quality.reparse_preview;
+  const reparseSummary = reparsed.available
+    ? `唯讀重新解析預覽：${reparsed.old_segment_count} → ${reparsed.new_segment_count} 段，規則候選 ${reparsed.new_candidates} 筆，時間失敗 ${reparsed.time_diagnostics.failed}。`
+    : `唯讀重新解析無法完成：${reparsed.errors.join("；")}`;
+  $("#meeting-quality-preview").textContent = `${quality.message} ${reparseSummary} 舊台帳疑似需複核 ${quality.suspected_issues.length} 筆；不會自動修改。`;
+  $("#meeting-local-results").replaceChildren();
+  $("#meeting-local-status").textContent = "本機模型結果僅顯示於此頁，不會自動儲存或入帳；服務不可用時，可繼續人工核對規則候選。";
+  const list = $("#meeting-results-list");
+  list.replaceChildren();
+  if (!data.items.length) list.append(el("p", "目前沒有規則候選。所有段落仍保留在逐字稿中，可人工檢視。", "hint"));
+  for (const item of data.items) {
+    const card = renderDraft(item);
+    const evidence = item.evidence;
+    card.prepend(el("p", `${item.kind}｜${item.review_status}｜來源 ${evidence.source_audio || "未指定"} ${evidence.source_id || ""}｜${evidence.timestamp_label}｜第 ${evidence.line_start || "?"} 行`, "hint"));
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = "展開原文上下文與核對提醒";
+    details.append(summary, el("pre", evidence.raw_text, "quote"));
+    for (const context of evidence.context) details.append(el("pre", `${context.source_audio || "來源未標示"}｜${context.timestamp_label}\n${context.text}`, "quote"));
+    for (const warning of item.quality_warnings) details.append(el("p", warning, "hint"));
+    card.append(details);
+    list.append(card);
+  }
+  $("#dlg-meeting-results").showModal();
+}
+
+async function analyzeMeetingLocally() {
+  const button = $("#btn-meeting-analyze-local");
+  const status = $("#meeting-local-status");
+  button.disabled = true;
+  status.textContent = "正在呼叫本機模型；長逐字稿會分段處理，等待時間依模型而異。";
+  $("#meeting-local-results").replaceChildren();
+  try {
+    const result = await api(`/api/transcripts/${encodeURIComponent(meetingResultId)}/analyze-local`, {
+      method: "POST", json: { timeout: 120 },
+    });
+    const coverage = result.coverage;
+    status.textContent = `${result.complete ? "全文分段處理完成" : "只完成部分分段"}：${coverage.covered_segments}/${coverage.total_segments}；模型 ${result.model}。結果未儲存，來源引用已由伺服器核驗。${result.message}`;
+    for (const item of result.items) {
+      item.model = result.model;
+      const article = el("article", "", "card");
+      article.append(el("h3", `${item.topic}｜${item.kind}`), el("p", item.summary));
+      if (item.action) article.append(el("p", `待辦動作：${item.action}`));
+      if (item.deliverable) article.append(el("p", `交付成果：${item.deliverable}`));
+      article.append(el("p", `負責人：${item.owner || "未指定"}；期限：${item.due_date || "未指定"}`, "hint"));
+      for (const cite of item.evidence) article.append(el("pre", `${cite.segment_id}\n${cite.quote}`, "quote"));
+      const save = el("button", "選為待審草稿");
+      save.type = "button";
+      save.addEventListener("click", async () => {
+        save.disabled = true;
+        try {
+          const stored = await api(`/api/transcripts/${encodeURIComponent(meetingResultId)}/outcomes`, {
+            method: "POST", json: { item },
+          });
+          status.textContent = stored.created ? "已加入待審草稿；可修改結論分類、摘要、動作、交付成果、負責人與期限，再自行選擇入帳。" : "相同模型候選已存在，未重複建立。";
+          await openMeetingResults(meetingResultId);
+        } catch (error) {
+          status.textContent = `無法保存候選：${error.message}`;
+          save.disabled = false;
+        }
+      });
+      article.append(save);
+      $("#meeting-local-results").append(article);
+    }
+    if (coverage.failed_chunks.length) {
+      status.textContent += ` 失敗分段：${coverage.failed_chunks.map((failure) => `${failure.chunk_index + 1} (${failure.error})`).join("；")}`;
+    }
+  } catch (error) {
+    status.textContent = `本機語意整理失敗：${error.message}。逐字稿與規則候選仍可使用；未產生語意成果。`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function downloadMeetingResults() {
+  const blob = new Blob(["\ufeff" + meetingResultMarkdown], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `meeting-results-${meetingResultTranscript || "transcript"}.md`;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 /** @param {string} id @returns {Promise<void>} */
@@ -1178,49 +1307,66 @@ async function reloadDrafts() {
 
 function renderDraft(draft) {
   const card = el("article", "", "card");
-  card.append(el("h3", `${draft.draft_id}　${draft.kind}　${draft.review_status}`));
+  card.append(el("h3", `${draft.draft_id}\uff5c${draft.kind}\uff5c${draft.review_status}`));
   card.append(el("p", draft.location_label, "hint"));
-  card.append(el("p", `時間：${draft.timestamp_label}`, "hint"));
-  card.append(el("p", `負責人：${draft.owner || "（空）"}（${draft.owner_origin}）　期限：${draft.due_date || "（空）"}（${draft.due_origin}）`, "hint"));
-  card.append(el("p", "原始引用（不會被摘要修改覆寫）"));
+  card.append(el("p", `\u6642\u9593\uff1a${draft.timestamp_label}`, "hint"));
+  card.append(el("p", `\u8ca0\u8cac\u4eba\uff1a${draft.owner || "\u672a\u6307\u5b9a"}\uff1b\u671f\u9650\uff1a${draft.due_date || "\u672a\u6307\u5b9a"}`, "hint"));
+  card.append(el("p", "\u539f\u6587\u5f15\u7528\u4e0d\u53ef\u4fee\u6539\uff1b\u6458\u8981\u8207\u5206\u985e\u9700\u4eba\u5de5\u6838\u5c0d\u3002"));
   card.append(el("pre", draft.source_quote, "quote"));
   const summary = document.createElement("textarea");
   summary.value = draft.summary;
   const owner = document.createElement("input");
   owner.value = draft.owner;
-  owner.placeholder = "負責人，原文沒有就留空";
+  owner.placeholder = "\u8ca0\u8cac\u4eba\uff08\u539f\u6587\u672a\u660e\u78ba\u6307\u5b9a\u5247\u7559\u7a7a\uff09";
   const due = document.createElement("input");
   due.type = "date";
   due.value = draft.due_date;
-  card.append(el("p", "摘要", "hint"), summary, el("p", "負責人／期限（可人工補，留空即未指定）", "hint"), owner, due);
+  const kind = document.createElement("select");
+  for (const value of ["\u6c7a\u8b70", "\u660e\u78ba\u6c7a\u8b70", "\u5f85\u8fa6", "\u73fe\u6cc1\u8aaa\u660e", "\u63d0\u8b70", "\u722d\u8b70", "\u5f85\u78ba\u8a8d"]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    kind.append(option);
+  }
+  kind.value = draft.kind;
+  const action = document.createElement("textarea");
+  action.placeholder = "\u5f85\u8fa6\u52d5\u4f5c\uff08\u539f\u6587\u672a\u660e\u78ba\u63d0\u4f9b\u5247\u7559\u7a7a\uff09";
+  action.value = draft.outcome?.action || "";
+  const deliverable = document.createElement("textarea");
+  deliverable.placeholder = "\u4ea4\u4ed8\u6210\u679c\uff08\u539f\u6587\u672a\u660e\u78ba\u63d0\u4f9b\u5247\u7559\u7a7a\uff09";
+  deliverable.value = draft.outcome?.deliverable || "";
+  card.append(el("p", "\u6458\u8981", "hint"), summary);
+  card.append(el("p", "\u7d50\u8ad6\u985e\u578b", "hint"), kind);
+  card.append(el("p", "\u5f85\u8fa6\u52d5\u4f5c\u8207\u4ea4\u4ed8\u6210\u679c", "hint"), action, deliverable);
+  card.append(el("p", "\u8ca0\u8cac\u4eba\u8207\u671f\u9650\u53ea\u6709\u539f\u6587\u660e\u78ba\u63d0\u4f9b\u6642\u624d\u586b\u3002", "hint"), owner, due);
   card.append(el("p", draft.limitation, "hint"));
   const actions = el("div", "", "row-actions");
-  if (draft.review_status === "草稿") {
-    const save = el("button", "儲存修改");
+  if (draft.review_status === "\u8349\u7a3f") {
+    const save = el("button", "\u5132\u5b58\u4fee\u8a02");
     save.type = "button";
-    save.addEventListener("click", () => saveDraft(draft.draft_id, summary.value, owner.value, due.value).catch((e) => showMsg(e.message, "error")));
-    const ok = el("button", "確認入帳", "primary");
+    save.addEventListener("click", () => saveDraft(draft.draft_id, summary.value, owner.value, due.value, kind.value, action.value, deliverable.value).catch((e) => showMsg(e.message, "error")));
+    const ok = el("button", "\u9078\u64c7\u5165\u5e33", "primary");
     ok.type = "button";
-    ok.addEventListener("click", () => confirmDraft(draft.draft_id, summary.value, owner.value, due.value).catch((e) => showMsg(e.message, "error")));
-    const drop = el("button", "捨棄");
+    ok.addEventListener("click", () => confirmDraft(draft.draft_id, summary.value, owner.value, due.value, kind.value, action.value, deliverable.value).catch((e) => showMsg(e.message, "error")));
+    const drop = el("button", "\u6368\u68c4");
     drop.type = "button";
     drop.addEventListener("click", () => discardDraft(draft.draft_id).catch((e) => showMsg(e.message, "error")));
     actions.append(save, ok, drop);
   } else if (draft.issue_id) {
-    actions.append(el("p", `已入帳：${draft.issue_id}`, "hint"));
+    actions.append(el("p", `\u5df2\u5165\u5e33\uff1a${draft.issue_id}`, "hint"));
   }
   card.append(actions);
   return card;
 }
 
-async function saveDraft(id, summary, owner, due) {
-  await api("/api/drafts/" + encodeURIComponent(id), { method: "PUT", json: { summary, owner, due_date: due } });
-  showMsg(`${id} 已更新。原始引用未改。`);
+async function saveDraft(id, summary, owner, due, kind, action, deliverable) {
+  await api("/api/drafts/" + encodeURIComponent(id), { method: "PUT", json: { summary, owner, due_date: due, kind, action, deliverable } });
+  showMsg(`${id} ?????????????`);
   await reloadDrafts();
 }
 
-async function confirmDraft(id, summary, owner, due) {
-  await saveDraft(id, summary, owner, due);
+async function confirmDraft(id, summary, owner, due, kind, action, deliverable) {
+  await saveDraft(id, summary, owner, due, kind, action, deliverable);
   const res = await api(`/api/drafts/${encodeURIComponent(id)}/confirm`, { method: "POST", json: {} });
   showMsg(res.message);
   await reloadDrafts();
@@ -1330,6 +1476,9 @@ async function init() {
   $("#btn-empty-new").addEventListener("click", openNew);
   $("#form-issue").addEventListener("submit", saveIssue);
   $("#btn-cancel").addEventListener("click", () => $("#dlg-issue").close());
+  $("#btn-delete-issue").addEventListener("click", () => {
+    if (state.editing) deleteIssue(state.editing);
+  });
   $("#btn-origin").addEventListener("click", () => showSourceSegment().catch((e) => showMsg(e.message, "error")));
   $("#btn-agenda").addEventListener("click", () => showAgenda().catch((e) => showMsg(e.message, "error")));
   $("#btn-agenda-close").addEventListener("click", () => $("#dlg-agenda").close());
@@ -1361,6 +1510,10 @@ async function init() {
   $("#import-file").addEventListener("change", (ev) => { state.importFile = ev.target.files[0] || null; });
   $("#btn-drafts").addEventListener("click", () => openDrafts().catch((e) => showMsg(e.message, "error")));
   $("#btn-transcripts").addEventListener("click", () => openTranscripts().catch((e) => showMsg(e.message, "error")));
+  $("#btn-meeting-results").addEventListener("click", () => openTranscripts().catch((e) => showMsg(e.message, "error")));
+  $("#btn-meeting-results-close").addEventListener("click", () => $("#dlg-meeting-results").close());
+  $("#btn-meeting-export").addEventListener("click", downloadMeetingResults);
+  $("#btn-meeting-analyze-local").addEventListener("click", analyzeMeetingLocally);
   $("#transcript-project").addEventListener("change", reloadTranscripts);
   $("#btn-transcripts-reload").addEventListener("click", reloadTranscripts);
   $("#btn-transcripts-close").addEventListener("click", () => $("#dlg-transcripts").close());

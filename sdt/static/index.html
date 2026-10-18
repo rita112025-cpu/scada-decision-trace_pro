@@ -15,6 +15,7 @@
   </div>
   <div class="actions">
     <button id="btn-transcripts" type="button">已匯入逐字稿</button>
+    <button id="btn-meeting-results" type="button">會議成果</button>
     <button id="btn-drafts" type="button">審核草稿 <span id="draft-count" class="count-badge">0</span></button>
     <button id="btn-import" type="button">匯入逐字稿</button>
     <button id="btn-new" class="primary" type="button">＋ 新增事項</button>
@@ -119,6 +120,7 @@
     <div id="form-fields" class="form-grid"></div>
     <div id="form-errors" class="msg error" hidden></div>
     <div class="dlg-actions">
+      <button type="button" id="btn-delete-issue" class="danger" hidden>刪除事項</button>
       <button type="button" id="btn-cancel">取消</button>
       <button type="submit" class="primary">儲存</button>
     </div>
@@ -190,6 +192,22 @@
   <div id="transcript-feedback" class="msg" role="status" hidden></div>
   <div id="transcript-list" class="stack scroll" aria-live="polite"></div>
   <div class="dlg-actions"><button id="btn-transcripts-close" type="button">關閉</button></div>
+</dialog>
+
+<dialog id="dlg-meeting-results" aria-labelledby="meeting-results-title">
+  <h2 id="meeting-results-title">會議成果與診斷</h2>
+  <p id="meeting-results-mode" class="msg" role="status"></p>
+  <div id="meeting-results-diagnostics" class="meeting-diagnostics"></div>
+  <p id="meeting-no-decision" class="hint" hidden>未辨識到可確認的決議。</p>
+  <p id="meeting-quality-preview" class="hint"></p>
+  <div class="dlg-actions"><button id="btn-meeting-analyze-local" type="button">用設定的本機 Ollama 整理</button></div>
+  <p id="meeting-local-status" class="hint" role="status"></p>
+  <div id="meeting-local-results" class="stack"></div>
+  <div id="meeting-results-list" class="stack scroll"></div>
+  <div class="dlg-actions">
+    <button id="btn-meeting-export" type="button">匯出 Markdown</button>
+    <button id="btn-meeting-results-close" class="primary" type="button">關閉</button>
+  </div>
 </dialog>
 
 <dialog id="dlg-transcript-delete" aria-labelledby="transcript-delete-title" aria-describedby="transcript-delete-note">
