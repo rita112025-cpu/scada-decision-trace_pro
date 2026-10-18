@@ -7,17 +7,26 @@ const THEME_KEY = "sdt-theme";
 const LAYOUT_KEY = "sdt-layout";
 const SECTION_KEY = "sdt-sidebar-sections";
 const ICONS_KEY = "sdt-sidebar-icons";
+const FILTER_LABELS = {
+  q: "搜尋", project: "專案", status: "狀態", priority: "優先級",
+  source_status: "來源狀態", owner: "負責人", issue_type: "類型",
+};
 const SECTION_DEFAULTS = { view: true, project: false, status: false, priority: false, source: false };
 const TEXTAREAS = new Set(["description", "source_excerpt", "acceptance_criteria"]);
 const ACTION_LABELS = {
   create: "新增", update: "修改", import: "匯入", sample: "範例", "clear-sample": "清除範例",
   "confirm-draft": "確認入帳", "rename-project": "重新命名專案",
+  "delete-transcript": "刪除逐字稿／解除來源關聯",
 };
 
 let META = null;
+let refreshVersion = 0;
+let transcriptListVersion = 0;
+/** @type {{transcript_id: string, preview_token: string} | null} */
+let transcriptDeletion = null;
 let state = {
   view: "all", editing: null, editingIssue: null, projects: [], importFile: null,
-  layout: "board", expanded: null, selected: null, items: [], facetItems: [], counts: {},
+  layout: "board", expanded: null, selected: null, items: [], facetItems: [], counts: {}, total: 0,
   history: [], historyFor: null, sections: null, sidebarIcons: false,
 };
 
@@ -113,7 +122,7 @@ function applyTheme(theme) {
   const dark = theme !== "light";
   document.documentElement.dataset.theme = dark ? "dark" : "light";
   const btn = $("#btn-theme");
-  btn.textContent = dark ? "☀ 切換為淺粉" : "☾ 切換為暗粉";
+  btn.textContent = dark ? "切換亮版" : "切換暗版";
   btn.setAttribute("aria-pressed", dark ? "true" : "false");
   try { localStorage.setItem(THEME_KEY, dark ? "dark" : "light"); } catch (e) { /* 隱私模式仍可切換，只是不記住 */ }
 }
@@ -129,15 +138,14 @@ function applyLayout(layout) {
   state.layout = layout;
   document.body.dataset.layout = layout;
   try { localStorage.setItem(LAYOUT_KEY, layout); } catch (e) { /* 同上 */ }
-  $("#view-board").hidden = layout !== "board";
-  $("#view-split").hidden = layout !== "split";
-  $("#view-segment").hidden = layout !== "segment";
+  $("#view-board").hidden = layout !== "board" || !state.items.length;
+  $("#view-split").hidden = layout !== "split" || !state.items.length;
+  $("#view-segment").hidden = layout !== "segment" || !state.items.length;
   $("#view-segments").hidden = layout !== "segment";
-  const slot = layout === "segment" ? $("#search-slot-top") : $("#search-slot-side");
-  slot.append($("#f-q"));
+  $("#segment-bar").hidden = layout !== "segment";
   for (const id of ["layout-board", "layout-split", "layout-segment"]) {
     const button = $("#" + id);
-    button.setAttribute("aria-selected", button.dataset.layout === layout ? "true" : "false");
+    button.setAttribute("aria-pressed", button.dataset.layout === layout ? "true" : "false");
   }
   if (layout === "split" && !state.selected && state.items[0]) state.selected = state.items[0].issue_id;
 }
@@ -166,6 +174,7 @@ async function pendingDraftCount(projects) {
 }
 
 async function refresh() {
+  const version = ++refreshVersion;
   const facet = new URLSearchParams({ view: state.view });
   for (const k of ["q", "issue_type", "owner"]) {
     const v = $("#f-" + k).value.trim();
@@ -176,10 +185,12 @@ async function refresh() {
     api("/api/projects"),
     api("/api/issues?" + facet.toString()),
   ]);
+  if (version !== refreshVersion) return;
   state.projects = projects.items;
   state.items = data.items;
   state.counts = data.counts;
   state.facetItems = base.items;
+  state.total = base.counts.all;
   fillProjectFilter();
   if (state.selected && !data.items.some((it) => it.issue_id === state.selected)) state.selected = null;
   if (state.layout === "split" && !state.selected && data.items[0]) state.selected = data.items[0].issue_id;
@@ -188,6 +199,7 @@ async function refresh() {
   $("#btn-sample-clear").hidden = !data.has_sample;
   $("#btn-sample-load").hidden = data.has_sample;
   const pending = await pendingDraftCount(state.projects);
+  if (version !== refreshVersion) return;
   const badge = $("#draft-count");
   badge.textContent = String(pending);
   if (state.layout === "split" && state.selected && state.historyFor !== state.selected) {
@@ -312,7 +324,7 @@ function renderSidebar() {
   const viewOpts = META.views.map((v) => ({
     value: v, label: VIEW_LABELS[v], count: counts[v] ?? 0, on: state.view === v,
   }));
-  nav.append(sideGroup("view", "檢視", viewOpts, (opt) => {
+  nav.append(sideGroup("view", "快捷篩選", viewOpts, (opt) => {
     if (state.view === opt.value) return;
     state.view = opt.value;
     refresh().catch((e) => showMsg(e.message, "error"));
@@ -630,11 +642,12 @@ function paint() {
     });
   }
   renderSidebar();
+  renderActiveFilters();
   renderViewSegments();
   renderBoard($("#view-board"), false);
   renderBoard($("#view-segment"), true);
   renderSplit();
-  $("#empty").hidden = state.items.length > 0;
+  renderResultState();
   for (const [sel, pos] of saved) {
     const node = $(sel);
     node.scrollTop = pos.top;
@@ -643,6 +656,56 @@ function paint() {
       if (pos.cols[i] != null) col.scrollTop = pos.cols[i];
     });
   }
+}
+
+/** @returns {void} */
+function renderResultState() {
+  const hasItems = state.items.length > 0;
+  const hasData = state.total > 0;
+  const summary = $("#result-summary");
+  summary.textContent = `共 ${state.total} 筆／目前顯示 ${state.items.length} 筆`;
+  summary.hidden = false;
+  $("#empty").hidden = hasItems;
+  $("#empty-title").textContent = hasData ? "沒有符合條件的事項" : "尚無事項";
+  $("#empty-description").textContent = hasData
+    ? "目前的搜尋或篩選條件沒有結果。可調整條件，或清除篩選以查看全部事項。"
+    : "匯入會議逐字稿，或手動新增第一筆事項，開始追蹤決議與證據。";
+  $("#btn-empty-import").hidden = hasData;
+  $("#btn-empty-new").hidden = hasData;
+  $("#btn-empty-clear").hidden = !hasData;
+  for (const layout of ["board", "split", "segment"]) {
+    $("#view-" + layout).hidden = state.layout !== layout || !hasItems;
+  }
+}
+
+function renderActiveFilters() {
+  const wrap = $("#filter-chips");
+  wrap.replaceChildren();
+  const appendChip = (label, clear) => {
+    const button = el("button", "", "filter-chip");
+    button.type = "button";
+    button.setAttribute("aria-label", "移除篩選：" + label);
+    button.title = "移除篩選：" + label;
+    const dismiss = el("span", "×", "filter-dismiss");
+    dismiss.setAttribute("aria-hidden", "true");
+    button.append(el("span", label, "filter-chip-label"), dismiss);
+    button.addEventListener("click", () => {
+      clear();
+      renderActiveFilters();
+      $("#f-q").focus();
+      refresh().catch((e) => showMsg(e.message, "error"));
+    });
+    wrap.append(button);
+  };
+  if (state.view !== "all") appendChip("快捷篩選：" + VIEW_LABELS[state.view], () => { state.view = "all"; });
+  for (const [key, label] of Object.entries(FILTER_LABELS)) {
+    const input = $("#f-" + key);
+    const value = input.value.trim();
+    if (!value) continue;
+    const project = key === "project" ? state.projects.find((p) => p.project_id === value) : null;
+    appendChip(label + "：" + (project ? project.name || project.project_id : value), () => { input.value = ""; });
+  }
+  $("#active-filters").hidden = !wrap.childElementCount;
 }
 
 function buildForm(issue) {
@@ -724,6 +787,10 @@ function showOrigin(issue) {
   $("#origin-quote").textContent = issue.source_quote || issue.source_excerpt || "";
   $("#origin-full").hidden = true;
   $("#origin-full").textContent = "";
+  $("#btn-origin").hidden = !has;
+  if (!has && issue.source_quote) {
+    $("#origin-meta").textContent = "逐字稿已解除關聯；以下為入帳時保留的原文摘錄，無法再回查逐字稿。";
+  }
 }
 
 async function openIssue(id) {
@@ -979,6 +1046,111 @@ async function confirmImport() {
   }
 }
 
+/** @returns {Promise<void>} */
+async function openTranscripts() {
+  state.projects = (await api("/api/projects")).items;
+  fillProjectSelect($("#transcript-project"), { selected: $("#f-project").value });
+  $("#transcript-feedback").hidden = true;
+  $("#dlg-transcripts").showModal();
+  await reloadTranscripts();
+}
+
+/** @returns {Promise<void>} */
+async function reloadTranscripts() {
+  const version = ++transcriptListVersion;
+  const box = $("#transcript-list");
+  const errors = $("#transcript-errors");
+  errors.hidden = true;
+  box.replaceChildren(el("p", "載入中…", "hint"));
+  const projectId = $("#transcript-project").value;
+  if (!projectId) {
+    box.replaceChildren(el("p", "尚無專案；請先匯入逐字稿並指定專案。", "hint"));
+    return;
+  }
+  try {
+    /** @type {{items: Array<{transcript_id: string, filename: string, imported_at: string}>}} */
+    const data = await api("/api/transcripts?" + new URLSearchParams({ project_id: projectId }));
+    if (version !== transcriptListVersion) return;
+    box.replaceChildren();
+    if (!data.items.length) box.append(el("p", "此專案尚未匯入逐字稿。", "hint"));
+    for (const item of data.items) {
+      const row = el("article", "", "transcript-entry");
+      const info = el("div", "", "transcript-info");
+      info.append(el("div", item.filename, "transcript-filename"),
+        el("p", `匯入時間：${item.imported_at}`, "hint"));
+      const button = el("button", "刪除", "danger");
+      button.type = "button";
+      button.setAttribute("aria-label", "刪除逐字稿：" + item.filename);
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await prepareTranscriptDelete(item.transcript_id);
+        } catch (e) {
+          errors.textContent = e.message;
+          errors.hidden = false;
+        } finally {
+          button.disabled = false;
+        }
+      });
+      row.append(info, button);
+      box.append(row);
+    }
+  } catch (e) {
+    if (version !== transcriptListVersion) return;
+    box.replaceChildren();
+    errors.textContent = e.message;
+    errors.hidden = false;
+  }
+}
+
+/** @param {string} id @returns {Promise<void>} */
+async function prepareTranscriptDelete(id) {
+  /** @type {{preview_token: string, filename: string, draft_count: number, pending_draft_count: number, confirmed_draft_count: number, discarded_draft_count: number, issue_count: number}} */
+  const impact = await api(`/api/transcripts/${encodeURIComponent(id)}/delete-preview`);
+  transcriptDeletion = { transcript_id: id, preview_token: impact.preview_token };
+  $("#transcript-delete-file").textContent = impact.filename;
+  $("#transcript-delete-impact").textContent =
+    `將刪除 ${impact.draft_count} 筆草稿紀錄（待審 ${impact.pending_draft_count}、已入帳 ${impact.confirmed_draft_count}、已捨棄 ${impact.discarded_draft_count}）。` +
+    `保留 ${impact.issue_count} 筆已入帳事項，並解除其逐字稿來源關聯。`;
+  $("#transcript-delete-errors").hidden = true;
+  $("#btn-transcript-delete-confirm").disabled = false;
+  $("#dlg-transcript-delete").showModal();
+}
+
+/** @returns {Promise<void>} */
+async function confirmTranscriptDelete() {
+  if (!transcriptDeletion) return;
+  const target = transcriptDeletion;
+  const button = $("#btn-transcript-delete-confirm");
+  const cancel = $("#btn-transcript-delete-cancel");
+  button.disabled = true;
+  cancel.disabled = true;
+  $("#transcript-delete-errors").hidden = true;
+  try {
+    /** @type {{drafts_deleted: number, issues_preserved: number, backup: string}} */
+    const result = await api(`/api/transcripts/${encodeURIComponent(target.transcript_id)}`, {
+      method: "DELETE", json: { confirm: true, preview_token: target.preview_token },
+    });
+    transcriptDeletion = null;
+    $("#dlg-transcript-delete").close();
+    const message = `已刪除逐字稿與 ${result.drafts_deleted} 筆草稿紀錄；保留 ${result.issues_preserved} 筆已入帳事項並解除來源關聯。磁碟原始檔未刪除。備份：${result.backup}`;
+    showMsg(message);
+    $("#transcript-feedback").textContent = message;
+    $("#transcript-feedback").hidden = false;
+    state.historyFor = null;
+    state.history = [];
+    await Promise.all([reloadTranscripts(), refresh().catch((e) => {
+      showMsg("逐字稿已刪除，但畫面更新失敗：" + e.message + "。請重新整理。", "warn");
+    })]);
+  } catch (e) {
+    const errors = $("#transcript-delete-errors");
+    errors.textContent = e.message + "\n請取消後重新載入逐字稿清單，再核對刪除影響。";
+    errors.hidden = false;
+  } finally {
+    cancel.disabled = false;
+  }
+}
+
 async function openDrafts() {
   state.projects = (await api("/api/projects")).items;
   fillProjectSelect($("#draft-project"), { selected: $("#f-project").value });
@@ -1144,13 +1316,18 @@ async function init() {
   fillSelect($("#f-source_status"), META.source_statuses);
 
   let timer;
-  const later = () => { clearTimeout(timer); timer = setTimeout(() => refresh().catch((e) => showMsg(e.message, "error")), 250); };
+  const later = () => {
+    renderActiveFilters();
+    clearTimeout(timer);
+    timer = setTimeout(() => refresh().catch((e) => showMsg(e.message, "error")), 250);
+  };
   for (const id of ["q", "owner"]) $("#f-" + id).addEventListener("input", later);
   for (const id of ["issue_type", "status", "priority", "source_status", "sort", "order", "project"]) {
     $("#f-" + id).addEventListener("change", later);
   }
 
   $("#btn-new").addEventListener("click", openNew);
+  $("#btn-empty-new").addEventListener("click", openNew);
   $("#form-issue").addEventListener("submit", saveIssue);
   $("#btn-cancel").addEventListener("click", () => $("#dlg-issue").close());
   $("#btn-origin").addEventListener("click", () => showSourceSegment().catch((e) => showMsg(e.message, "error")));
@@ -1160,17 +1337,39 @@ async function init() {
     .then(() => showMsg("議程已複製")).catch(() => showMsg("無法存取剪貼簿，請手動選取複製", "warn")));
   $("#btn-agenda-download").addEventListener("click", downloadAgenda);
   $("#file-import").addEventListener("change", importCsv);
+  $("#btn-csv-import").addEventListener("click", () => $("#file-import").click());
+  const clearFilters = () => {
+    clearTimeout(timer);
+    state.view = "all";
+    for (const key of Object.keys(FILTER_LABELS)) $("#f-" + key).value = "";
+    renderActiveFilters();
+    $("#f-q").focus();
+    refresh().catch((e) => showMsg(e.message, "error"));
+  };
+  $("#btn-clear-filters").addEventListener("click", clearFilters);
+  $("#btn-empty-clear").addEventListener("click", clearFilters);
   $("#btn-backup").addEventListener("click", () => api("/api/backup", { method: "POST", json: {} })
     .then((r) => showMsg(`已備份：data/backups/${r.file}`)).catch((e) => showMsg(e.message, "error")));
   $("#btn-sample-load").addEventListener("click", () => api("/api/sample/load", { method: "POST", json: {} })
     .then((r) => { showMsg(`已載入 ${r.loaded} 筆範例資料`); return refresh(); }).catch((e) => showMsg(e.message, "error")));
   $("#btn-sample-clear").addEventListener("click", clearSample);
   $("#btn-import").addEventListener("click", () => openImport().catch((e) => showMsg(e.message, "error")));
+  $("#btn-empty-import").addEventListener("click", () => openImport().catch((e) => showMsg(e.message, "error")));
   $("#btn-import-close").addEventListener("click", () => $("#dlg-import").close());
   $("#btn-import-preview").addEventListener("click", () => previewImport());
   $("#btn-import-confirm").addEventListener("click", () => confirmImport());
   $("#import-file").addEventListener("change", (ev) => { state.importFile = ev.target.files[0] || null; });
   $("#btn-drafts").addEventListener("click", () => openDrafts().catch((e) => showMsg(e.message, "error")));
+  $("#btn-transcripts").addEventListener("click", () => openTranscripts().catch((e) => showMsg(e.message, "error")));
+  $("#transcript-project").addEventListener("change", reloadTranscripts);
+  $("#btn-transcripts-reload").addEventListener("click", reloadTranscripts);
+  $("#btn-transcripts-close").addEventListener("click", () => $("#dlg-transcripts").close());
+  $("#btn-transcript-delete-cancel").addEventListener("click", () => $("#dlg-transcript-delete").close());
+  $("#dlg-transcript-delete").addEventListener("close", () => { transcriptDeletion = null; });
+  $("#dlg-transcript-delete").addEventListener("cancel", (ev) => {
+    if ($("#btn-transcript-delete-cancel").disabled) ev.preventDefault();
+  });
+  $("#btn-transcript-delete-confirm").addEventListener("click", confirmTranscriptDelete);
   $("#btn-draft-close").addEventListener("click", () => $("#dlg-drafts").close());
   $("#btn-draft-reload").addEventListener("click", () => reloadDrafts().catch((e) => showMsg(e.message, "error")));
   $("#draft-project").addEventListener("change", () => reloadDrafts().catch((e) => showMsg(e.message, "error")));

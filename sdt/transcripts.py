@@ -10,6 +10,7 @@ import json
 import math
 import pathlib
 import re
+import sqlite3
 
 from . import db
 
@@ -564,6 +565,56 @@ def get_transcript(conn, transcript_id):
     if row is None:
         raise db.NotFound(transcript_id, "找不到此逐字稿")
     return dict(row)
+
+
+def _linked_issues(conn: sqlite3.Connection, transcript_id: str) -> list[dict]:
+    rows = conn.execute(
+        """SELECT * FROM issues WHERE transcript_id=?
+           OR draft_id IN (SELECT draft_id FROM drafts WHERE transcript_id=?)
+           OR segment_ref IN (SELECT segment_id FROM transcript_segments WHERE transcript_id=?)
+           ORDER BY issue_id""", (transcript_id, transcript_id, transcript_id))
+    return [dict(row) for row in rows]
+
+
+def deletion_preview(conn: sqlite3.Connection, transcript_id: str) -> dict:
+    """Return counts and a snapshot token without exposing transcript text."""
+    transcript = get_transcript(conn, transcript_id)
+    drafts = [dict(row) for row in conn.execute(
+        "SELECT * FROM drafts WHERE transcript_id=? ORDER BY draft_id", (transcript_id,))]
+    issues = _linked_issues(conn, transcript_id)
+    snapshot = json.dumps([transcript, drafts, issues], sort_keys=True, ensure_ascii=False)
+    return {
+        "transcript_id": transcript_id, "project_id": transcript["project_id"],
+        "filename": transcript["filename"], "draft_count": len(drafts),
+        "pending_draft_count": sum(d["review_status"] == "草稿" for d in drafts),
+        "confirmed_draft_count": sum(d["review_status"] == "已確認" for d in drafts),
+        "discarded_draft_count": sum(d["review_status"] == "已捨棄" for d in drafts),
+        "issue_count": len(issues),
+        "preview_token": hashlib.sha256(snapshot.encode("utf-8")).hexdigest(),
+    }
+
+
+def delete_transcript(conn: sqlite3.Connection, transcript_id: str, *,
+                      preview_token: str, operator: str) -> dict:
+    """Remove imported data atomically; keep ledger entries and copied evidence."""
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    impact = deletion_preview(conn, transcript_id)
+    if not preview_token or preview_token != impact["preview_token"]:
+        raise db.ValidationError(["受影響資料已改變，請取消後重新按刪除，核對最新數量再確認。"])
+    when = db.now_str()
+    for issue in _linked_issues(conn, transcript_id):
+        for field in ("transcript_id", "segment_ref", "draft_id"):
+            if issue[field]:
+                db._log(conn, issue["issue_id"], when, operator, "delete-transcript", field, issue[field], "")
+        conn.execute(
+            "UPDATE issues SET transcript_id='', segment_ref='', draft_id='', updated_at=? WHERE issue_id=?",
+            (when, issue["issue_id"]))
+    conn.execute("DELETE FROM drafts WHERE transcript_id=?", (transcript_id,))
+    conn.execute("DELETE FROM transcript_segments WHERE transcript_id=?", (transcript_id,))
+    conn.execute("DELETE FROM transcripts WHERE transcript_id=?", (transcript_id,))
+    return {"deleted": True, "drafts_deleted": impact["draft_count"],
+            "issues_preserved": impact["issue_count"], "transcript_id": transcript_id}
 
 
 def list_segments(conn, transcript_id):

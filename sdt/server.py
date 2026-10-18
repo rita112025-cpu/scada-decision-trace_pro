@@ -82,6 +82,9 @@ def make_handler(app):
         def do_PUT(self):
             self._dispatch("PUT")
 
+        def do_DELETE(self):
+            self._dispatch("DELETE")
+
         def _dispatch(self, method):
             url = urllib.parse.urlsplit(self.path)
             parts = [urllib.parse.unquote(p) for p in url.path.strip("/").split("/") if p]
@@ -235,6 +238,20 @@ def make_handler(app):
             if route == ("GET", "transcripts") and len(parts) == 1:
                 with app.conn() as conn:
                     return self._json(200, {"items": transcripts.list_transcripts(conn, query.get("project_id", ""))})
+            if route == ("GET", "transcripts") and len(parts) == 3 and parts[2] == "delete-preview":
+                with app.lock, app.conn() as conn:
+                    return self._json(200, transcripts.deletion_preview(conn, parts[1]))
+            if route == ("DELETE", "transcripts") and len(parts) == 2:
+                data = self._json_body()
+                if data.get("confirm") is not True or not isinstance(data.get("preview_token"), str):
+                    raise db.ValidationError(["請先核對受影響數量，再確認刪除逐字稿。"])
+                with app.lock:
+                    pre = backup.backup(app.cfg.db_path, app.cfg.backup_dir, label="pre-delete-transcript")
+                    with app.conn() as conn:
+                        result = transcripts.delete_transcript(
+                            conn, parts[1], preview_token=data["preview_token"], operator=app.cfg.operator)
+                result["backup"] = pre.name
+                return self._json(200, result)
             if route == ("GET", "transcripts") and len(parts) == 3 and parts[2] == "segments":
                 with app.conn() as conn:
                     return self._json(200, {"items": transcripts.list_segments(conn, parts[1])})
