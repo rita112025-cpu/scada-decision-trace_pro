@@ -21,22 +21,31 @@ def _line(issue, today):
     return f"- {parts[0]}\n  - " + "｜".join(meta)
 
 
-def build_sections(conn, today=None):
+def build_sections(conn, today=None, project_id=""):
     today = today or db.today_str()
-    open_items = db.list_issues(conn, view="open", sort="due_date", today=today)
+    filters = {"project_id": project_id} if project_id else None
+    open_items = db.list_issues(conn, view="open", sort="due_date", today=today, filters=filters)
     return today, [
         ("一、逾期事項", [i for i in open_items if db.is_overdue(i, today)]),
         ("二、高優先事項", [i for i in open_items if i["priority"] == "高"]),
         ("三、等待他人回覆", [i for i in open_items if i["status"] == "等待他人回覆"]),
         ("四、尚未驗收（待驗收）", [i for i in open_items if i["status"] == "待驗收"]),
-        ("五、來源待確認／有爭議", db.list_issues(conn, view="disputed", sort="due_date", today=today)),
+        ("五、來源待確認／有爭議", db.list_issues(conn, view="disputed", sort="due_date", today=today, filters=filters)),
     ]
 
 
-def build_agenda(conn, today=None, title="協調會議議程（草稿）"):
-    today, sections = build_sections(conn, today)
+def scope_label(conn, project_id=""):
+    if not project_id:
+        return "全部專案"
+    project = db.get_project(conn, project_id)
+    return f"{project['name'] or '（未命名）'}（{project['project_id']}）"
+
+
+def build_agenda(conn, today=None, title="協調會議議程（草稿）", project_id=""):
+    today, sections = build_sections(conn, today, project_id)
     out = [f"# {title}", "",
            f"- 產生日期：{today}",
+           f"- 範圍：{scope_label(conn, project_id)}",
            "- 說明：本草稿僅依台帳現有資料整理，未新增事項、未推定任何決議；"
            "會議結論請於會後由與會者確認後再回填台帳。", ""]
     for heading, items in sections:

@@ -75,6 +75,21 @@ function fillProjectFilter() {
   if ([...sel.options].some((o) => o.value === current)) sel.value = current;
 }
 
+function currentProjectId() {
+  return $("#f-project").value;
+}
+
+// 匯出與議程只跟著目前選取的專案；沒選專案時，按鈕明確標示「全部專案」。
+function paintExportScope() {
+  const id = currentProjectId();
+  const project = state.projects.find((p) => p.project_id === id);
+  const scope = id ? (project ? projectLabel(project) : id) : "全部專案";
+  const link = $("#btn-export");
+  link.href = "/api/export.csv" + (id ? "?" + new URLSearchParams({ project_id: id }) : "");
+  link.textContent = `匯出 CSV（${scope}）`;
+  $("#btn-agenda").textContent = `議程草稿（${scope}）`;
+}
+
 function fillProjectSelect(sel, { includeNew = false, selected = "" } = {}) {
   sel.replaceChildren();
   for (const p of state.projects) sel.append(new Option(projectLabel(p), p.project_id));
@@ -182,6 +197,7 @@ async function refresh() {
   state.counts = data.counts;
   state.facetItems = base.items;
   fillProjectFilter();
+  paintExportScope();
   if (state.selected && !data.items.some((it) => it.issue_id === state.selected)) state.selected = null;
   if (state.layout === "split" && !state.selected && data.items[0]) state.selected = data.items[0].issue_id;
   if (state.selected !== state.historyFor) state.history = [];
@@ -1368,7 +1384,8 @@ async function saveRename() {
 }
 
 async function showAgenda() {
-  const data = await api("/api/agenda");
+  const id = currentProjectId();
+  const data = await api("/api/agenda" + (id ? "?" + new URLSearchParams({ project_id: id }) : ""));
   $("#agenda-text").value = data.markdown;
   $("#dlg-agenda").showModal();
 }

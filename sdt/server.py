@@ -179,10 +179,16 @@ def make_handler(app):
                     issue, warnings, diff = db.update_issue(conn, parts[1], data, app.cfg.operator)
                 return self._json(200, {"issue": issue, "warnings": warnings, "changed": diff})
             if route == ("GET", "export.csv"):
+                project_id = query.get("project_id", "")
                 with app.conn() as conn:
-                    body = csvio.export_issues(db.list_issues(conn, sort="issue_id", today=today))
+                    if project_id:
+                        db.get_project(conn, project_id)
+                    filters = {"project_id": project_id} if project_id else None
+                    body = csvio.export_issues(
+                        db.list_issues(conn, sort="issue_id", today=today, filters=filters))
+                suffix = f"-{project_id}" if project_id else "-all"
                 return self._send(200, body, "text/csv; charset=utf-8", {
-                    "Content-Disposition": f"attachment; filename=\"issues-{today}.csv\""})
+                    "Content-Disposition": f"attachment; filename=\"issues-{today}{suffix}.csv\""})
             if route == ("GET", "history.csv"):
                 with app.conn() as conn:
                     body = csvio.export_history(db.get_history(conn))
@@ -197,8 +203,10 @@ def make_handler(app):
                 result["backup"] = pre.name
                 return self._json(200, result)
             if route == ("GET", "agenda"):
+                project_id = query.get("project_id", "")
                 with app.conn() as conn:
-                    return self._json(200, {"markdown": agenda.build_agenda(conn, today)})
+                    return self._json(200, {"markdown": agenda.build_agenda(
+                        conn, today, project_id=project_id)})
             if route == ("POST", "backup"):
                 with app.lock:
                     path = backup.backup(app.cfg.db_path, app.cfg.backup_dir)

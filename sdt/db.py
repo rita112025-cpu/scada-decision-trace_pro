@@ -71,6 +71,10 @@ TRACE_COLUMNS = (
 )
 
 EXTRA_SCHEMA = """
+CREATE TABLE IF NOT EXISTS id_counters (
+    name TEXT PRIMARY KEY,
+    last_value INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS projects (
     project_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -220,10 +224,11 @@ def migrate(conn):
         conn.execute(
             "UPDATE issues SET project_id=? WHERE project=? AND (project_id IS NULL OR project_id='')",
             (pid, name))
+    seed_issue_counter(conn)
 
 
 # 結構有變就加 1。已是這個版本的資料庫不再每次連線都跑建表與遷移。
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def connect(path):
@@ -335,11 +340,66 @@ def get_issue(conn, issue_id):
     return _row_to_dict(row)
 
 
+ISSUE_PREFIX = "SDT-"
+_ISSUE_ID_RE = re.compile(r"SDT-(\d+)")
+_REMOVE_ACTIONS = ("delete", "clear-sample")
+_CREATE_ACTIONS = ("create", "import", "sample")
+
+
+def _issue_number(issue_id):
+    m = _ISSUE_ID_RE.fullmatch(issue_id or "")
+    return int(m[1]) if m else 0
+
+
+def _max_used_issue_number(conn):
+    """掃描 issues 與 issue_history，找出曾經用過的最大 SDT- 編號。"""
+    best = 0
+    for table in ("issues", "issue_history"):
+        for row in conn.execute(f"SELECT DISTINCT issue_id FROM {table} WHERE issue_id GLOB 'SDT-[0-9]*'"):
+            best = max(best, _issue_number(row[0]))
+    return best
+
+
+def seed_issue_counter(conn):
+    """流水號只增不減。遷移時取計數器、現有事項與變更紀錄三者的最大值，已刪除的編號也算已用過。"""
+    row = conn.execute("SELECT last_value FROM id_counters WHERE name='issue'").fetchone()
+    value = max(row[0] if row else 0, _max_used_issue_number(conn))
+    conn.execute(
+        "INSERT INTO id_counters(name, last_value) VALUES('issue', ?)"
+        " ON CONFLICT(name) DO UPDATE SET last_value=excluded.last_value", (value,))
+
+
+def _issue_id_used(conn, issue_id):
+    return bool(conn.execute("SELECT 1 FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM issue_history WHERE issue_id=? LIMIT 1", (issue_id,)).fetchone())
+
+
 def _next_issue_id(conn):
-    n = conn.execute("SELECT COUNT(*) FROM issues").fetchone()[0] + 1
-    while conn.execute("SELECT 1 FROM issues WHERE issue_id=?", (f"SDT-{n:04d}",)).fetchone():
+    row = conn.execute("SELECT last_value FROM id_counters WHERE name='issue'").fetchone()
+    n = (row[0] if row else 0) + 1
+    while _issue_id_used(conn, f"{ISSUE_PREFIX}{n:04d}"):
         n += 1
-    return f"SDT-{n:04d}"
+    _set_issue_counter(conn, n)
+    return f"{ISSUE_PREFIX}{n:04d}"
+
+
+def _set_issue_counter(conn, n):
+    conn.execute(
+        "INSERT INTO id_counters(name, last_value) VALUES('issue', ?)"
+        " ON CONFLICT(name) DO UPDATE SET last_value=MAX(last_value, excluded.last_value)", (n,))
+
+
+def reused_issue_ids(conn):
+    """變更紀錄裡，同一編號在刪除之後又出現建立紀錄的編號。這些歷史混有不同事項，需人工核對，不自動拆分。"""
+    removes = ",".join("?" * len(_REMOVE_ACTIONS))
+    creates = ",".join("?" * len(_CREATE_ACTIONS))
+    rows = conn.execute(
+        f"""SELECT DISTINCT c.issue_id FROM issue_history c
+            WHERE c.action IN ({creates}) AND EXISTS (
+                SELECT 1 FROM issue_history r
+                WHERE r.issue_id=c.issue_id AND r.action IN ({removes}) AND r.id < c.id)
+            ORDER BY c.issue_id""", (*_CREATE_ACTIONS, *_REMOVE_ACTIONS))
+    return [r[0] for r in rows]
 
 
 def next_public_id(conn, table, column, prefix):
@@ -446,6 +506,10 @@ def create_issue(conn, data, operator, *, now=None, action="create", is_sample=F
     issue_id = _clean_text(issue_id or data.get("issue_id")) or _next_issue_id(conn)
     if conn.execute("SELECT 1 FROM issues WHERE issue_id=?", (issue_id,)).fetchone():
         raise ValidationError([f"事項編號 {issue_id} 已存在"])
+    if conn.execute("SELECT 1 FROM issue_history WHERE issue_id=? LIMIT 1", (issue_id,)).fetchone():
+        raise ValidationError([f"事項編號 {issue_id} 曾經使用過（已刪除），不能重新建立。請清空編號欄位讓系統配新號"])
+    if _issue_number(issue_id):
+        _set_issue_counter(conn, _issue_number(issue_id))
     cols = ["issue_id", *EDITABLE_FIELDS, "project_id", "created_at", "updated_at", "is_sample"]
     vals = [issue_id, *(clean[k] for k in EDITABLE_FIELDS), pid, created_at or when, when, int(is_sample)]
     conn.execute(f"INSERT INTO issues({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", vals)
@@ -642,7 +706,7 @@ def wipe_all(conn):
     counts = {}
     for table in (
         "document_links", "extraction_runs", "drafts", "transcript_segments",
-        "transcripts", "issues", "issue_history", "projects",
+        "transcripts", "issues", "issue_history", "projects", "id_counters",
     ):
         counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         conn.execute(f"DELETE FROM {table}")
