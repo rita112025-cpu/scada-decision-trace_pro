@@ -20,6 +20,13 @@ RULE_V5 = "rule:v5"
 # v6 的判斷規則與 v5 相同；差別只在同一句同時像決議與交辦時，另列一筆待辦候選。
 RULE_V6 = "rule:v6"
 EXTRACTION_METHOD = RULE_V6
+# 人工從原文建立的候選。不是規則抽取；重新抽取時佔住同一句同類型的位置。
+MANUAL_METHOD = "manual"
+MANUAL_LIMITATION = (
+    "人工建立的候選：由使用者從逐字稿原文選句建立，不是規則抽取。"
+    "原始引用取自所選的那一句，不會被摘要修改覆寫；摘要、負責人與期限由使用者填寫。"
+    "仍須按「確認入帳」才會寫進正式台帳。"
+)
 LIMITATION = (
     "能力限制：此環境沒有可用的既有抽取器，也未呼叫外部 API 或下載模型。"
     "草稿只是可人工審核的候選，不是對會議的自動理解。"
@@ -1218,13 +1225,20 @@ def confirm_draft(conn, draft_id, operator, *, now=None):
     issue_type = {"決議": "會議決議", "待辦": "待辦"}.get(kind)
     if not issue_type:
         raise db.ValidationError([f"未知的草稿類型 {kind}"])
-    description = (
-        f"【{kind}】由逐字稿草稿確認入帳。抽取方式：{draft['extraction_method']}。\n"
-        f"對上的說法：{draft.get('cue') or '（無）'}。信心：{draft.get('confidence') or '（無）'}。\n"
-        "規則抽取，不是模型。沒有被收成草稿的句子不代表已經判斷正確；"
-        "負責人與期限留空表示這一句沒有明文。\n\n"
-        f"{draft['summary']}"
-    )
+    if draft["extraction_method"] == MANUAL_METHOD:
+        description = (
+            f"【{kind}】由人工從逐字稿原文建立的草稿確認入帳。抽取方式：{MANUAL_METHOD}（不是規則抽取）。\n"
+            "負責人與期限由人工填寫；留空表示未指定。\n\n"
+            f"{draft['summary']}"
+        )
+    else:
+        description = (
+            f"【{kind}】由逐字稿草稿確認入帳。抽取方式：{draft['extraction_method']}。\n"
+            f"對上的說法：{draft.get('cue') or '（無）'}。信心：{draft.get('confidence') or '（無）'}。\n"
+            "規則抽取，不是模型。沒有被收成草稿的句子不代表已經判斷正確；"
+            "負責人與期限留空表示這一句沒有明文。\n\n"
+            f"{draft['summary']}"
+        )
     data = {
         "project_id": project["project_id"],
         "project": project["name"],
@@ -1630,7 +1644,9 @@ def _reextract_plan(conn, transcript_id):
         base["segment_id"] = seg["segment_id"]
         if pos in claimed:
             holder = positioned.get(pos) or mapped.get(pos)
-            if pos in positioned:
+            if pos in positioned and holder.get("extraction_method") == MANUAL_METHOD:
+                reason = "manual"
+            elif pos in positioned:
                 reason = "position"
             elif holder and holder["draft_id"] in stripped:
                 reason = "legacy_position"
@@ -1820,6 +1836,119 @@ def _reextract_message(plan, *, applied):
     if plan["pending_review"]:
         text += "有舊草稿無法對到唯一的來源位置，已在結果標為待核對，沒有為它們新增草稿。"
     return text
+
+
+def source_sentences(conn, transcript_id):
+    """逐字稿的段落與句子，附上每一句已有的候選。供人工從原文補建候選。不寫入。
+
+    句子切法與規則抽取相同，句序因此可與規則候選共用同一個來源位置。
+    """
+    item = get_transcript(conn, transcript_id)
+    drafts = conn.execute(
+        """SELECT draft_id, segment_id, sentence_index, kind, review_status, extraction_method, summary
+           FROM drafts WHERE transcript_id=? ORDER BY draft_id""", (transcript_id,)).fetchall()
+    by_pos = {}
+    by_segment = {}
+    for d in drafts:
+        row = dict(d)
+        by_segment.setdefault(row["segment_id"], []).append(row)
+        if row["sentence_index"]:
+            by_pos.setdefault((row["segment_id"], row["sentence_index"]), []).append(row)
+    segments = []
+    for seg in list_segments(conn, transcript_id):
+        prepared = _prepare_segment(seg)
+        sentences = [
+            {
+                "sentence_index": str(index),
+                "text": sentence,
+                "drafts": by_pos.get((seg["segment_id"], str(index)), []),
+            }
+            for index, sentence in enumerate(_sentences(seg.get("text") or ""), start=1)
+        ]
+        segments.append({
+            "segment_id": seg["segment_id"],
+            "location_label": prepared["location_label"],
+            "timestamp_label": seg.get("timestamp_label") or "",
+            "sentences": sentences,
+            "unpositioned_drafts": [
+                d for d in by_segment.get(seg["segment_id"], []) if not d["sentence_index"]],
+        })
+    return {
+        "transcript_id": transcript_id,
+        "project_id": item["project_id"],
+        "filename": item["filename"],
+        "segments": segments,
+    }
+
+
+def _same_segment_kind(conn, segment_id, kind):
+    rows = conn.execute(
+        """SELECT draft_id, sentence_index, kind, review_status, extraction_method, summary, source_quote
+           FROM drafts WHERE segment_id=? AND kind=? ORDER BY draft_id""", (segment_id, kind)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def create_manual_draft(conn, transcript_id, data, *, now=None):
+    """人工從原文選一句建立候選草稿。不自動入帳。
+
+    同一段落已有同類型候選（任何審核狀態）時，除非 data["confirm_duplicate"] 為 True，
+    否則丟 NeedsChoice 列出既有候選，由使用者決定是否仍要建立。
+    """
+    item = get_transcript(conn, transcript_id)
+    kind = db._clean_text(data.get("kind"))
+    if kind not in ("決議", "待辦"):
+        raise db.ValidationError(["類型只能是「決議」或「待辦」"])
+    segment = get_segment(conn, transcript_id, db._clean_text(data.get("segment_id")))
+    sentence_index = db._clean_text(data.get("sentence_index"))
+    sentences = _sentences(segment.get("text") or "")
+    if not sentence_index.isdigit() or not 1 <= int(sentence_index) <= len(sentences):
+        raise db.ValidationError(["請選擇這個段落裡的一句原文"])
+    summary = db._clean_text(data.get("summary"))
+    if not summary:
+        raise db.ValidationError(["摘要不可空白，請自行填寫"])
+    owner = db._clean_text(data.get("owner"))
+    try:
+        due = db.parse_date(data.get("due_date"))
+    except ValueError:
+        raise db.ValidationError([f"期限「{data.get('due_date')}」格式錯誤，請用 YYYY-MM-DD"])
+    existing = _same_segment_kind(conn, segment["segment_id"], kind)
+    if existing and data.get("confirm_duplicate") is not True:
+        raise NeedsChoice({
+            "needs_confirm": True,
+            "created": False,
+            "existing": existing,
+            "message": (
+                f"這個段落已有 {len(existing)} 筆「{kind}」候選（含已捨棄、已確認）。"
+                "請先核對；若仍要建立，請再確認一次。"
+            ),
+        })
+    quote = sentences[int(sentence_index) - 1]
+    prepared = _prepare_segment(segment)
+    cand = {
+        "kind": kind,
+        "summary": summary,
+        "source_quote": quote,
+        "location_label": prepared["location_label"],
+        "timestamp_label": segment.get("timestamp_label") or "",
+        "extraction_method": MANUAL_METHOD,
+        "limitation": MANUAL_LIMITATION,
+        "owner": owner,
+        "owner_origin": "人工" if owner else "未指定",
+        "due_date": due,
+        "due_origin": "人工" if due else "未指定",
+        "review_gaps": "人工從原文建立，沒有經過規則判斷。請核對摘要、負責人與期限是否與原文相符。",
+        "context_refs": [],
+        "sentence_index": sentence_index,
+    }
+    draft = _insert_draft(
+        conn, project_id=item["project_id"], transcript_id=transcript_id,
+        segment_id=segment["segment_id"], cand=cand, when=now or db.now_str())
+    return {
+        "created": True,
+        "draft": draft,
+        "existing": existing,
+        "message": f"已建立人工候選 {draft['draft_id']}，狀態是草稿，尚未入帳。",
+    }
 
 
 def discard_draft(conn, draft_id, *, now=None):

@@ -17,7 +17,7 @@ const ACTION_LABELS = {
 
 let META = null;
 let state = {
-  view: "all", editing: null, editingIssue: null, projects: [], importFile: null,
+  view: "all", editing: null, editingIssue: null, projects: [], importFile: null, sourceTranscript: null,
   layout: "board", expanded: null, selected: null, items: [], facetItems: [], counts: {},
   history: [], historyFor: null, sections: null, sidebarIcons: false,
 };
@@ -967,14 +967,128 @@ async function loadReparseTranscripts() {
     const pick = el("button", "選取");
     pick.type = "button";
     pick.addEventListener("click", () => { sel.value = item.transcript_id; });
+    const source = el("button", "從原文補建候選");
+    source.type = "button";
+    source.addEventListener("click", () => openSource(item.transcript_id).catch((e) => showMsg(e.message, "error")));
     const remove = el("button", "刪除此逐字稿", "danger");
     remove.type = "button";
     remove.addEventListener("click", () => deleteTranscript(item.transcript_id).catch((e) => showMsg(e.message, "error")));
-    actions.append(pick, remove);
+    actions.append(pick, source, remove);
     card.append(actions);
     list.append(card);
   }
   if (!data.items.length) list.append(el("p", "這個專案還沒有匯入逐字稿。", "hint"));
+}
+
+function draftLabel(d) {
+  const method = d.extraction_method === "manual" ? "人工" : (d.extraction_method || "—");
+  return `${d.draft_id} ${d.kind} ${d.review_status}（${method}）`;
+}
+
+async function openSource(transcriptId) {
+  state.sourceTranscript = transcriptId;
+  await reloadSource();
+  if (!$("#dlg-source").open) $("#dlg-source").showModal();
+}
+
+async function reloadSource() {
+  const data = await api(`/api/transcripts/${encodeURIComponent(state.sourceTranscript)}/sentences`);
+  $("#source-title").textContent = `${data.transcript_id}　${data.filename}　${data.segments.length} 段`;
+  const box = $("#source-list");
+  box.replaceChildren();
+  for (const seg of data.segments) {
+    const card = el("article", "", "card");
+    card.append(el("p", `${seg.location_label}　${seg.timestamp_label}`, "hint"));
+    if (seg.unpositioned_drafts.length) {
+      card.append(el("p", `這段另有舊資料草稿（未記錄句子位置）：${seg.unpositioned_drafts.map(draftLabel).join("、")}`, "hint"));
+    }
+    if (!seg.sentences.length) card.append(el("p", "（這段沒有可選的句子）", "hint"));
+    for (const sentence of seg.sentences) card.append(renderSourceSentence(seg, sentence));
+    box.append(card);
+  }
+  if (!data.segments.length) box.append(el("p", "這份逐字稿沒有段落。", "hint"));
+}
+
+function renderSourceSentence(seg, sentence) {
+  const row = el("div", "", "stack");
+  row.append(el("pre", `第 ${sentence.sentence_index} 句：${sentence.text}`, "quote"));
+  if (sentence.drafts.length) {
+    row.append(el("p", `這一句已有候選：${sentence.drafts.map(draftLabel).join("、")}`, "hint"));
+  }
+  const actions = el("div", "", "row-actions");
+  const form = el("div", "", "stack");
+  form.hidden = true;
+  for (const kind of ["決議", "待辦"]) {
+    const add = el("button", `新增${kind}`);
+    add.type = "button";
+    add.addEventListener("click", () => {
+      form.replaceChildren(...manualForm(seg, sentence, kind, form));
+      form.hidden = false;
+    });
+    actions.append(add);
+  }
+  row.append(actions, form);
+  return row;
+}
+
+function manualForm(seg, sentence, kind, form) {
+  const summary = document.createElement("textarea");
+  summary.placeholder = `${kind}摘要（必填，請自己填寫）`;
+  const owner = document.createElement("input");
+  owner.placeholder = "負責人（可留空）";
+  const due = document.createElement("input");
+  due.type = "date";
+  const errors = el("div", "", "msg error");
+  errors.hidden = true;
+  const save = el("button", `建立${kind}草稿`, "primary");
+  save.type = "button";
+  const cancel = el("button", "取消");
+  cancel.type = "button";
+  cancel.addEventListener("click", () => { form.hidden = true; form.replaceChildren(); });
+  const body = () => ({
+    segment_id: seg.segment_id,
+    sentence_index: sentence.sentence_index,
+    kind,
+    summary: summary.value,
+    owner: owner.value,
+    due_date: due.value,
+  });
+  save.addEventListener("click", () => createManual(body(), errors).catch((e) => {
+    errors.textContent = e.message;
+    errors.hidden = false;
+  }));
+  const buttons = el("div", "", "row-actions");
+  buttons.append(save, cancel);
+  return [el("p", `新增${kind}：原文引用會用上面這一句，不能修改`, "hint"), summary, owner, due, errors, buttons];
+}
+
+async function createManual(body, errors) {
+  errors.hidden = true;
+  const res = await fetch(`/api/transcripts/${encodeURIComponent(state.sourceTranscript)}/manual-drafts`, {
+    method: "POST",
+    headers: { "X-SDT": "1", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 409 && data.needs_confirm) {
+    const lines = [data.message, ""].concat(
+      data.existing.map((d) => `${draftLabel(d)}　第 ${d.sentence_index || "—"} 句：${d.summary}`));
+    askDelete("同一段已有同類型候選", lines.join("\n"), [
+      { label: "取消，不建立", onClick: () => {} },
+      {
+        label: "仍要建立",
+        onClick: () => createManual({ ...body, confirm_duplicate: true }, errors).catch((e) => {
+          errors.textContent = e.message;
+          errors.hidden = false;
+        }),
+      },
+    ]);
+    return;
+  }
+  if (!res.ok) throw new Error((data.errors || ["操作失敗"]).join("\n"));
+  showMsg(data.message);
+  await reloadSource();
+  await refresh();
 }
 
 async function openImport() {
@@ -1063,6 +1177,7 @@ async function previewReextract() {
     legacy_position: "舊草稿已依來源位置對上，原句保留",
     ambiguous: "無法唯一定位，標為待核對，沒有新增",
     position: "來源位置已有草稿",
+    manual: "這一句已有人工建立的同類型候選",
   };
   for (const row of res.skipped.slice(0, 8)) {
     lines.push(`略過 ${row.kind} 第 ${row.line || "—"} 行第 ${row.sentence_index} 句（${why[row.reason] || "來源位置已有草稿"}）`);
@@ -1499,6 +1614,7 @@ async function init() {
   $("#import-file").addEventListener("change", (ev) => { state.importFile = ev.target.files[0] || null; });
   $("#btn-drafts").addEventListener("click", () => openDrafts().catch((e) => showMsg(e.message, "error")));
   $("#btn-draft-close").addEventListener("click", () => $("#dlg-drafts").close());
+  $("#btn-source-close").addEventListener("click", () => $("#dlg-source").close());
   $("#btn-draft-reload").addEventListener("click", () => reloadDrafts().catch((e) => showMsg(e.message, "error")));
   $("#draft-project").addEventListener("change", () => reloadDrafts().catch((e) => showMsg(e.message, "error")));
   $("#draft-status").addEventListener("change", () => reloadDrafts().catch((e) => showMsg(e.message, "error")));
