@@ -464,7 +464,7 @@ class TestReextract(Base):
         self.assertFalse(preview["applied"])
         self.assertEqual(preview["added_count"], 0)
         self.assertEqual(preview["skipped_count"], len(before_ids))
-        self.assertEqual(preview["extraction_method"], "rule:v5")
+        self.assertEqual(preview["extraction_method"], transcripts.EXTRACTION_METHOD)
         self.assertEqual(preview["runs"], [])
         self.assertIn("尚未寫入", preview["message"])
         self.assertEqual(sorted(d["draft_id"] for d in transcripts.list_drafts(
@@ -472,7 +472,7 @@ class TestReextract(Base):
         first = transcripts.reextract_apply(self.conn, tid)
         self.assertTrue(first["applied"])
         self.assertEqual(first["added_count"], 0)
-        self.assertEqual(first["extraction_method"], "rule:v5")
+        self.assertEqual(first["extraction_method"], transcripts.EXTRACTION_METHOD)
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["summary"], "人工改寫的虛構摘要")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["review_status"], "已確認")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["source_quote"], quote)
@@ -494,7 +494,7 @@ class TestReextract(Base):
         created = transcripts.get_draft(self.conn, applied["added_draft_ids"][0])
         self.assertEqual(created["review_status"], "草稿")
         self.assertEqual(created["sentence_index"], "2")
-        self.assertEqual(created["extraction_method"], "rule:v5")
+        self.assertEqual(created["extraction_method"], transcripts.EXTRACTION_METHOD)
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["summary"], "人工改寫的虛構摘要")
         self.assertEqual(transcripts.get_draft(self.conn, other["draft_id"])["sentence_index"], "1")
         self.assertEqual(transcripts.get_draft(self.conn, draft["draft_id"])["source_quote"], quote)
@@ -507,9 +507,9 @@ class TestReextract(Base):
             "SELECT extraction_method, added_count, skipped_count FROM extraction_runs WHERE transcript_id=? ORDER BY run_id",
             (tid,)).fetchall()
         self.assertEqual([tuple(r) for r in runs], [
-            ("rule:v5", 0, len(before_ids)),
-            ("rule:v5", 1, len(before_ids)),
-            ("rule:v5", 0, len(before_ids) + 1),
+            (transcripts.EXTRACTION_METHOD, 0, len(before_ids)),
+            (transcripts.EXTRACTION_METHOD, 1, len(before_ids)),
+            (transcripts.EXTRACTION_METHOD, 0, len(before_ids) + 1),
         ])
         draft_count = len(transcripts.list_drafts(self.conn, project_id=proj["project_id"], transcript_id=tid))
         transcripts.reparse_apply(self.conn, tid)
@@ -912,7 +912,7 @@ class TestSpokenRules(Base):
                 key,
             )
             self.assertFalse(cand["source_quote"].startswith("["))
-            self.assertEqual(cand["extraction_method"], "rule:v5")
+            self.assertEqual(cand["extraction_method"], transcripts.EXTRACTION_METHOD)
             if cand["confidence"] != "高":
                 self.assertIn(cand["cue"], cand["reason"])
         self.assertEqual(by_pos[("18", 1)]["source_quote"], "那就這樣。")
@@ -994,9 +994,10 @@ class TestSpokenRules(Base):
             self.assertEqual(
                 (hit[0]["kind"], hit[0]["cue"], hit[0]["confidence"], hit[0]["owner"], hit[0]["due_date"],
                  hit[0]["extraction_method"]),
-                ("待辦", "你們先", "中", "", "", "rule:v5"),
+                ("待辦", "你們先", "中", "", "", transcripts.EXTRACTION_METHOD),
                 text,
             )
+            self.assertEqual([(c["kind"], c["cue"]) for c in one(text, "rule:v5")], [("待辦", "你們先")], text)
             self.assertEqual(one(text, "rule:v2"), [], text)
         for text in missed_by_v4:
             self.assertEqual(one(text, "rule:v4"), [], text)

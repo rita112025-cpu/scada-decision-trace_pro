@@ -17,11 +17,13 @@ RULE_V2 = "rule:v2"
 RULE_V3 = "rule:v3"
 RULE_V4 = "rule:v4"
 RULE_V5 = "rule:v5"
-EXTRACTION_METHOD = RULE_V5
+# v6 的判斷規則與 v5 相同；差別只在同一句同時像決議與交辦時，另列一筆待辦候選。
+RULE_V6 = "rule:v6"
+EXTRACTION_METHOD = RULE_V6
 LIMITATION = (
     "能力限制：此環境沒有可用的既有抽取器，也未呼叫外部 API 或下載模型。"
     "草稿只是可人工審核的候選，不是對會議的自動理解。"
-    "目前抽取版本是 rule:v5。明文標記（決議：、定案、決定採用、待辦、請＋姓名＋動作）仍沿用 rule:v2，信心標為高。"
+    "目前抽取版本是 rule:v6。明文標記（決議：、定案、決定採用、待辦、請＋姓名＋動作）仍沿用 rule:v2，信心標為高。"
     "口語定案與交辦信心標為中；本機說法清單對上的標為低。"
     "「麻煩」要後面接著對象和動作（例如確認、提供、回覆、更新、補）才列為待辦。"
     "談預算、報價、費用，以及「但是麻煩」這種有條件的請求，不列為待辦。"
@@ -30,7 +32,7 @@ LIMITATION = (
     "「那就這樣」若在談價錢或帶著「但是」，不當成定案。"
     "「然後就是核准過的版本」這種歷史敘述不是這次的決議。很短的應聲（對、嗯、好、OK）也不列。"
     "負責人與期限只有這一句明文寫出才填，不依講者或前後文猜測。"
-    "同一句若同時像決議又像交辦，只產生一筆決議草稿。"
+    "同一句若同時像決議又像交辦，分別產生一筆決議與一筆待辦草稿，兩筆共用同一句原文，各自審核與入帳。"
     "相鄰段落只作核對用，不會把多人的話拼成一句原話。"
     "草稿必須經人工確認後才會寫進正式台帳。沒有列進規則的講法仍可能漏掉，列進去的仍可能誤收。"
 )
@@ -696,7 +698,7 @@ def _todo_cue(sentence, *, method):
     v4 的「你們先」只接較短的動作清單。v5 放寬成常見工程交辦動詞，
     仍排除問句以外、由呼叫端先擋下的假設／否定／過去，以及報價議價。
     """
-    tight_trouble = method in {RULE_V4, RULE_V5}
+    tight_trouble = method in {RULE_V4, RULE_V5, RULE_V6}
     for cue in _TODO_CUES:
         if cue == "麻煩":
             if re.search(r"(?:比較|很|太|有點|真|稍|不)麻煩", sentence):
@@ -717,7 +719,7 @@ def _todo_cue(sentence, *, method):
                 if _YOU_FIRST_V4.search(sentence):
                     return cue
                 continue
-            if method == RULE_V5:
+            if method in {RULE_V5, RULE_V6}:
                 if _price_context(sentence):
                     continue
                 if _YOU_FIRST_V5.search(sentence):
@@ -846,7 +848,55 @@ def _classify_candidate(sentence, method, extra_cues):
     return None
 
 
-def _review_gaps(kind, owner, due, context_used, also_todo):
+def _spoken_allowed_hits(sentence, method, extra_cues):
+    """口語與本機說法清單的決議、待辦各自判斷。問句、假設、否定、歷史敘述一律擋下。"""
+    if _colloquial_blocked(sentence):
+        return None, None
+    cue = _decision_cue(sentence, tightened=True)
+    todo_cue = _todo_cue(sentence, method=method)
+    local_decision = _local_cue(sentence, (extra_cues or {}).get("decisions"))
+    local_todo = _local_cue(sentence, (extra_cues or {}).get("todos"))
+    decision = None
+    if cue:
+        decision = _spoken_hit("決議", "D7", cue, "中", "builtin", False)
+    elif local_decision:
+        decision = _spoken_hit("決議", "D8", local_decision, "低", "local", False)
+    todo = None
+    if todo_cue:
+        todo = _spoken_hit("待辦", "T4", todo_cue, "中", "builtin", False)
+    elif local_todo:
+        todo = _spoken_hit("待辦", "T5", local_todo, "低", "local", False)
+    return decision, todo
+
+
+def _classify_v6(sentence, extra_cues):
+    """v6：決議與待辦分開判斷。每一類先看明文規則，沒對上才看口語（含排除條件）。
+
+    明文與口語可以混在同一句，例如明文決議加口語交辦。
+    """
+    decision_rule = _decision_rule(sentence)
+    todo_rule = _todo_rule(sentence)
+    spoken_decision, spoken_todo = (None, None)
+    if not (decision_rule and todo_rule):
+        spoken_decision, spoken_todo = _spoken_allowed_hits(sentence, RULE_V6, extra_cues)
+    decision = _explicit_hit("決議", *decision_rule, False) if decision_rule else spoken_decision
+    todo = _explicit_hit("待辦", *todo_rule, False) if todo_rule else spoken_todo
+    if decision and todo:
+        decision["also_todo"] = True
+        decision["paired"] = True
+        todo["paired"] = True
+    return [hit for hit in (decision, todo) if hit]
+
+
+def _classify_candidates(sentence, method, extra_cues):
+    """同一句的候選清單。v6 回傳決議、待辦各至多一筆；舊版沿用單筆判斷（決議優先）。"""
+    if method == RULE_V6:
+        return _classify_v6(sentence, extra_cues)
+    hit = _classify_candidate(sentence, method, extra_cues)
+    return [hit] if hit else []
+
+
+def _review_gaps(kind, owner, due, context_used, also_todo, paired=False):
     gaps = []
     if not owner:
         gaps.append("缺負責人：這一句沒有明文姓名，欄位留空，不依講者或前後文猜測。")
@@ -854,10 +904,14 @@ def _review_gaps(kind, owner, due, context_used, also_todo):
         gaps.append("缺期限：這一句沒有明文日期，欄位留空，不依前後文猜測。")
     if kind == "決議":
         gaps.append("請人工核對這是本次定案，而不是提議、疑問、否定、取消、歷史狀態或一般描述。")
-        if also_todo:
+        if paired:
+            gaps.append("這一句也像交辦，已另列一筆待辦候選，兩筆共用同一句原文，請分別審核。")
+        elif also_todo:
             gaps.append("這一句也像交辦，但同一句只留決議候選，交辦內容請人工另判。")
     else:
         gaps.append("請人工核對這是明確交辦，而不是順口提到的動作或已取消的事項。")
+        if paired:
+            gaps.append("這一句也列為決議候選，兩筆共用同一句原文，請分別審核。")
     if context_used:
         gaps.append("有附上相鄰段落的段落 ID、時間與原文供核對指代；那些文字沒有併進這筆原始引用。")
     else:
@@ -875,14 +929,16 @@ def _context_ref(seg):
 
 
 def extract_candidates(segments, method=None, extra_cues=None):
-    """由段落產生候選草稿。同一句最多一筆；不會把草稿寫進正式台帳。
+    """由段落產生候選草稿。不會把草稿寫進正式台帳。
+
+    同一句最多一筆決議、一筆待辦（v6 起才會兩筆並存，舊版只留決議）；兩筆共用同一句原文。
 
     前後段只在本句已有候選、且出現指代時附上，用來給人核對。不用前後段多收草稿，
-    也不把多段原文接成一句。method 可指定 rule:v2、rule:v3 或 rule:v4，用來重現舊版；省略時用 rule:v5。
+    也不把多段原文接成一句。method 可指定 rule:v2～rule:v5，用來重現舊版；省略時用 rule:v6。
     extra_cues 只在 v3 以後生效，問句與歷史敘述仍然先被擋下。
     """
     method = method or EXTRACTION_METHOD
-    if method not in {RULE_V2, RULE_V3, RULE_V4, RULE_V5}:
+    if method not in {RULE_V2, RULE_V3, RULE_V4, RULE_V5, RULE_V6}:
         raise db.ValidationError([f"未知的抽取版本 {method}"])
     cues = None if method == RULE_V2 else extra_cues
     ordered = list(segments)
@@ -891,14 +947,9 @@ def extract_candidates(segments, method=None, extra_cues=None):
     for index, seg in enumerate(ordered):
         source_id = str(seg.get("source_segment_id") or f"#{index}")
         for sentence_index, sentence in enumerate(_sentences(seg.get("text") or ""), start=1):
-            hit = _classify_candidate(sentence, method, cues)
-            if not hit:
+            hits = _classify_candidates(sentence, method, cues)
+            if not hits:
                 continue
-            # 同一來源位置只留一筆（決議優先）。相同句子出現在別的段落要各自保留。
-            key = (source_id, sentence_index)
-            if key in seen:
-                continue
-            seen.add(key)
             if method == RULE_V2:
                 owner = extract_owner(sentence)
             else:
@@ -907,29 +958,35 @@ def extract_candidates(segments, method=None, extra_cues=None):
             context = []
             if _ANAPHORA.search(sentence) and index > 0:
                 context.append(_context_ref(ordered[index - 1]))
-            found.append({
-                "segment_key": source_id,
-                "segment_id": seg.get("segment_id") or "",
-                "sentence_index": sentence_index,
-                "kind": hit["kind"],
-                "summary": sentence,
-                "source_quote": sentence,
-                "location_label": seg.get("location_label") or "",
-                "timestamp_label": seg.get("timestamp_label") or "",
-                "owner": owner,
-                "owner_origin": "原文" if owner else "未指定",
-                "due_date": due,
-                "due_origin": "原文" if due else "未指定",
-                "extraction_method": method,
-                "limitation": LIMITATION,
-                "rule_id": hit["rule_id"],
-                "reason": hit["reason"],
-                "cue": hit["cue"],
-                "confidence": hit["confidence"],
-                "review_gaps": _review_gaps(
-                    hit["kind"], owner, due, bool(context), hit["also_todo"]),
-                "context_refs": context,
-            })
+            for hit in hits:
+                # 同一來源位置、同一類型只留一筆。相同句子出現在別的段落要各自保留。
+                key = (source_id, sentence_index, hit["kind"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append({
+                    "segment_key": source_id,
+                    "segment_id": seg.get("segment_id") or "",
+                    "sentence_index": sentence_index,
+                    "kind": hit["kind"],
+                    "summary": sentence,
+                    "source_quote": sentence,
+                    "location_label": seg.get("location_label") or "",
+                    "timestamp_label": seg.get("timestamp_label") or "",
+                    "owner": owner,
+                    "owner_origin": "原文" if owner else "未指定",
+                    "due_date": due,
+                    "due_origin": "原文" if due else "未指定",
+                    "extraction_method": method,
+                    "limitation": LIMITATION,
+                    "rule_id": hit["rule_id"],
+                    "reason": hit["reason"],
+                    "cue": hit["cue"],
+                    "confidence": hit["confidence"],
+                    "review_gaps": _review_gaps(
+                        hit["kind"], owner, due, bool(context), hit["also_todo"], hit.get("paired", False)),
+                    "context_refs": [dict(ref) for ref in context],
+                })
     return found
 
 
@@ -1452,8 +1509,8 @@ def _pending_legacy(draft, segment):
 def _map_legacy_drafts(drafts, prepared, occupied=()):
     """沒有句序的舊草稿依來源位置對上。時間前綴只用來定位，不回寫原文。
 
-    對到唯一的（檔案內段落、行、句序）就佔住該位置。對不到或對到多處則列為待核對，
-    那些位置不新增草稿。
+    位置是（段落、句序、類型）。對到唯一的就佔住該位置。對不到或對到多處則列為待核對，
+    那些位置的同類型不新增草稿。
     """
     by_id = {seg["segment_id"]: seg for seg in prepared if seg.get("segment_id")}
     occupied = set(occupied)
@@ -1473,6 +1530,7 @@ def _map_legacy_drafts(drafts, prepared, occupied=()):
     for draft in drafts:
         if str(draft.get("sentence_index") or ""):
             continue
+        kind = draft["kind"]
         body, had_stamp = _legacy_body(draft["source_quote"])
         if had_stamp:
             stripped.add(draft["draft_id"])
@@ -1482,13 +1540,13 @@ def _map_legacy_drafts(drafts, prepared, occupied=()):
             hits = []
             if own and body and body == (own.get("text") or "").strip():
                 count = len(_sentences(own.get("text") or ""))
-                hits = [(own["segment_id"], str(index)) for index in range(1, count + 1)]
+                hits = [(own["segment_id"], str(index), kind) for index in range(1, count + 1)]
             flag(draft, hits)
             continue
         if own:
             indexes = _sentence_indexes(own, body)
             if len(indexes) == 1:
-                pos = (own["segment_id"], indexes[0])
+                pos = (own["segment_id"], indexes[0], kind)
                 if pos in occupied:
                     flag(draft, [pos])
                     continue
@@ -1500,7 +1558,7 @@ def _map_legacy_drafts(drafts, prepared, occupied=()):
                     mapped[pos] = draft
                 continue
             if len(indexes) > 1:
-                flag(draft, [(own["segment_id"], index) for index in indexes])
+                flag(draft, [(own["segment_id"], index, kind) for index in indexes])
                 continue
         hits = []
         for seg in prepared:
@@ -1511,7 +1569,7 @@ def _map_legacy_drafts(drafts, prepared, occupied=()):
             if stamped:
                 hits = stamped
         if len(hits) == 1:
-            pos = (hits[0][0], hits[0][1])
+            pos = (hits[0][0], hits[0][1], kind)
             if pos in occupied:
                 flag(draft, [pos])
                 continue
@@ -1522,14 +1580,14 @@ def _map_legacy_drafts(drafts, prepared, occupied=()):
             else:
                 mapped[pos] = draft
         else:
-            flag(draft, [(hit[0], hit[1]) for hit in hits])
+            flag(draft, [(hit[0], hit[1], kind) for hit in hits])
     return mapped, stripped, pending, suppress
 
 
 def _reextract_plan(conn, transcript_id):
     """比對目前規則與既有草稿。不寫入。
 
-    已有句子位置的草稿佔住 (段落, 句序)。沒有句子位置的舊草稿先辨識句首時間標記，
+    已有句子位置的草稿佔住 (段落, 句序, 類型)；同一句的決議與待辦各佔一個位置。沒有句子位置的舊草稿先辨識句首時間標記，
     再依段落與句序一對一佔位；原句不回寫。無法唯一定位的舊草稿列為待核對，不新增草稿。
     """
     item = get_transcript(conn, transcript_id)
@@ -1544,7 +1602,7 @@ def _reextract_plan(conn, transcript_id):
     for draft in drafts:
         index = str(draft.get("sentence_index") or "")
         if index:
-            positioned[(draft["segment_id"], index)] = draft
+            positioned[(draft["segment_id"], index, draft["kind"])] = draft
     by_id = {seg["segment_id"]: seg for seg in prepared if seg.get("segment_id")}
     mapped, stripped, pending, suppress = _map_legacy_drafts(drafts, prepared, positioned)
     added = []
@@ -1568,7 +1626,7 @@ def _reextract_plan(conn, transcript_id):
         if seg is None or not seg.get("segment_id"):
             skipped.append(dict(base, segment_id="", draft_id="", reason="not_found"))
             continue
-        pos = (seg["segment_id"], sentence_index)
+        pos = (seg["segment_id"], sentence_index, cand["kind"])
         base["segment_id"] = seg["segment_id"]
         if pos in claimed:
             holder = positioned.get(pos) or mapped.get(pos)
