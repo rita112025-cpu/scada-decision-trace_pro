@@ -821,10 +821,7 @@ def _classify_candidate(sentence, method, extra_cues):
     todo = _todo_rule(sentence)
     if decision:
         rule_id, reason = decision
-        hit = _explicit_hit("決議", rule_id, reason, bool(todo))
-        if todo:
-            hit["todo_hit"] = _explicit_hit("待辦", todo[0], todo[1], False)
-        return hit
+        return _explicit_hit("決議", rule_id, reason, bool(todo))
     if method == RULE_V2:
         if not todo:
             return None
@@ -835,39 +832,68 @@ def _classify_candidate(sentence, method, extra_cues):
         return _explicit_hit("待辦", rule_id, reason, False)
     if _colloquial_blocked(sentence):
         return None
-    tightened = method in {RULE_V4, RULE_V5, RULE_V6}
+    tightened = method in {RULE_V4, RULE_V5}
     cue = _decision_cue(sentence, tightened=tightened)
     todo_cue = _todo_cue(sentence, method=method)
     local_decision = _local_cue(sentence, (extra_cues or {}).get("decisions"))
     local_todo = _local_cue(sentence, (extra_cues or {}).get("todos"))
-    todo_hit = None
-    if todo_cue:
-        todo_hit = _spoken_hit("待辦", "T4", todo_cue, "中", "builtin", False)
-    elif local_todo:
-        todo_hit = _spoken_hit("待辦", "T5", local_todo, "低", "local", False)
-    hit = None
     if cue:
-        hit = _spoken_hit("決議", "D7", cue, "中", "builtin", bool(todo_hit))
+        return _spoken_hit("決議", "D7", cue, "中", "builtin", bool(todo_cue or local_todo))
+    if local_decision:
+        return _spoken_hit("決議", "D8", local_decision, "低", "local", bool(todo_cue or local_todo))
+    if todo_cue:
+        return _spoken_hit("待辦", "T4", todo_cue, "中", "builtin", False)
+    if local_todo:
+        return _spoken_hit("待辦", "T5", local_todo, "低", "local", False)
+    return None
+
+
+def _spoken_allowed_hits(sentence, method, extra_cues):
+    """口語與本機說法清單的決議、待辦各自判斷。問句、假設、否定、歷史敘述一律擋下。"""
+    if _colloquial_blocked(sentence):
+        return None, None
+    cue = _decision_cue(sentence, tightened=True)
+    todo_cue = _todo_cue(sentence, method=method)
+    local_decision = _local_cue(sentence, (extra_cues or {}).get("decisions"))
+    local_todo = _local_cue(sentence, (extra_cues or {}).get("todos"))
+    decision = None
+    if cue:
+        decision = _spoken_hit("決議", "D7", cue, "中", "builtin", False)
     elif local_decision:
-        hit = _spoken_hit("決議", "D8", local_decision, "低", "local", bool(todo_hit))
-    if hit is None:
-        return todo_hit
-    if todo_hit:
-        hit["todo_hit"] = todo_hit
-    return hit
+        decision = _spoken_hit("決議", "D8", local_decision, "低", "local", False)
+    todo = None
+    if todo_cue:
+        todo = _spoken_hit("待辦", "T4", todo_cue, "中", "builtin", False)
+    elif local_todo:
+        todo = _spoken_hit("待辦", "T5", local_todo, "低", "local", False)
+    return decision, todo
+
+
+def _classify_v6(sentence, extra_cues):
+    """v6：決議與待辦分開判斷。每一類先看明文規則，沒對上才看口語（含排除條件）。
+
+    明文與口語可以混在同一句，例如明文決議加口語交辦。
+    """
+    decision_rule = _decision_rule(sentence)
+    todo_rule = _todo_rule(sentence)
+    spoken_decision, spoken_todo = (None, None)
+    if not (decision_rule and todo_rule):
+        spoken_decision, spoken_todo = _spoken_allowed_hits(sentence, RULE_V6, extra_cues)
+    decision = _explicit_hit("決議", *decision_rule, False) if decision_rule else spoken_decision
+    todo = _explicit_hit("待辦", *todo_rule, False) if todo_rule else spoken_todo
+    if decision and todo:
+        decision["also_todo"] = True
+        decision["paired"] = True
+        todo["paired"] = True
+    return [hit for hit in (decision, todo) if hit]
 
 
 def _classify_candidates(sentence, method, extra_cues):
-    """同一句的候選清單。v6 起，同時像決議與交辦時回傳兩筆；舊版只回傳決議。"""
+    """同一句的候選清單。v6 回傳決議、待辦各至多一筆；舊版沿用單筆判斷（決議優先）。"""
+    if method == RULE_V6:
+        return _classify_v6(sentence, extra_cues)
     hit = _classify_candidate(sentence, method, extra_cues)
-    if not hit:
-        return []
-    todo_hit = hit.pop("todo_hit", None)
-    if method == RULE_V6 and todo_hit:
-        hit["paired"] = True
-        todo_hit["paired"] = True
-        return [hit, todo_hit]
-    return [hit]
+    return [hit] if hit else []
 
 
 def _review_gaps(kind, owner, due, context_used, also_todo, paired=False):

@@ -9,6 +9,13 @@ from sdt import db, transcripts
 BOTH = "決議：採用虛構甲案，請王假設於 2026-11-05 前更新虛構圖面。"
 SPOKEN_BOTH = "那就這樣，你們先把虛構圖改一版。"
 ONLY_DECISION = "決議：採用虛構乙案。"
+# 明文決議＋口語交辦、口語定案＋明文交辦
+MIXED_EXPLICIT_DECISION = "決議：採用虛構甲案，你們先把虛構圖改一版。"
+MIXED_EXPLICIT_TODO = "那就這樣，請王假設更新虛構圖面。"
+MIXED = {
+    MIXED_EXPLICIT_DECISION: [("決議", "D1"), ("待辦", "T4")],
+    MIXED_EXPLICIT_TODO: [("決議", "D7"), ("待辦", "T2")],
+}
 
 
 def b64(text):
@@ -38,6 +45,27 @@ class TestExtractSplit(unittest.TestCase):
         self.assertEqual([(c["kind"], c["rule_id"], c["cue"]) for c in found],
                          [("決議", "D7", "那就這樣"), ("待辦", "T4", "你們先")])
         self.assertEqual({c["source_quote"] for c in found}, {SPOKEN_BOTH})
+
+    def test_mixed_explicit_and_spoken_split(self):
+        for text, expected in MIXED.items():
+            found = one(text)
+            self.assertEqual([(c["kind"], c["rule_id"]) for c in found], expected, text)
+            self.assertEqual({c["source_quote"] for c in found}, {text})
+            self.assertEqual({c["sentence_index"] for c in found}, {1})
+            for c in found:
+                self.assertIn("兩筆共用同一句原文", c["review_gaps"], text)
+
+    def test_mixed_older_methods_keep_previous_single_result(self):
+        self.assertEqual([(c["kind"], c["rule_id"]) for c in one(MIXED_EXPLICIT_DECISION, "rule:v5")],
+                         [("決議", "D1")])
+        self.assertEqual([(c["kind"], c["rule_id"]) for c in one(MIXED_EXPLICIT_TODO, "rule:v5")],
+                         [("待辦", "T2")])
+
+    def test_spoken_guards_still_apply_when_mixed(self):
+        # 明文交辦照收；口語定案仍受假設、歷史敘述等排除條件擋下，與 v5 相同
+        for text in ("如果那就這樣，請王假設更新虛構圖面。", "請王假設更新虛構圖面，之前已經那就這樣了。"):
+            self.assertEqual([(c["kind"], c["rule_id"]) for c in one(text)], [("待辦", "T2")], text)
+            self.assertEqual([(c["kind"], c["rule_id"]) for c in one(text, "rule:v5")], [("待辦", "T2")], text)
 
     def test_older_methods_keep_single_decision(self):
         for method in ("rule:v2", "rule:v3", "rule:v4", "rule:v5"):
@@ -119,6 +147,47 @@ class TestImportAndConfirm(Base):
         self.assertEqual(transcripts.get_draft(self.conn, decision["draft_id"])["review_status"], "已捨棄")
         with self.assertRaises(db.ValidationError):
             transcripts.confirm_draft(self.conn, decision["draft_id"], "測試員")
+
+
+class TestMixedImportAndReextract(Base):
+    def test_mixed_sentences_imported_as_pairs_and_reextract_stable(self):
+        imported = self.import_text(list(MIXED))
+        tid = imported["transcript_id"]
+        by_quote = {}
+        for d in imported["drafts"]:
+            by_quote.setdefault(d["source_quote"], []).append((d["kind"], d["rule_id"]))
+        self.assertEqual({q: sorted(v) for q, v in by_quote.items()},
+                         {q: sorted(v) for q, v in MIXED.items()})
+        first_ids = sorted(d["draft_id"] for d in imported["drafts"])
+        todo = next(d for d in imported["drafts"]
+                    if d["source_quote"] == MIXED_EXPLICIT_DECISION and d["kind"] == "待辦")
+        transcripts.update_draft(self.conn, todo["draft_id"], {"summary": "人工待辦摘要"})
+        for _ in range(2):
+            self.assertEqual(transcripts.reextract_preview(self.conn, tid)["added_count"], 0)
+            self.assertEqual(transcripts.reextract_apply(self.conn, tid)["added_count"], 0)
+        self.assertEqual(sorted(d["draft_id"] for d in self.drafts(tid)), first_ids)
+        self.assertEqual(transcripts.get_draft(self.conn, todo["draft_id"])["summary"], "人工待辦摘要")
+        for d in imported["drafts"]:
+            transcripts.confirm_draft(self.conn, d["draft_id"], "測試員")
+        issues = db.list_issues(self.conn)
+        self.assertEqual(sorted((i["source_quote"], i["issue_type"]) for i in issues), sorted(
+            (q, t) for q in MIXED for t in ("會議決議", "待辦")))
+
+    def test_old_single_mixed_drafts_backfill_missing_kind(self):
+        # 舊版各留一筆（明文決議句留決議、口語定案句留待辦），重抽補上缺的那一類
+        imported = self.import_text(list(MIXED))
+        tid = imported["transcript_id"]
+        for d in imported["drafts"]:
+            missing = (d["source_quote"] == MIXED_EXPLICIT_DECISION and d["kind"] == "待辦") or (
+                d["source_quote"] == MIXED_EXPLICIT_TODO and d["kind"] == "決議")
+            if missing:
+                self.conn.execute("DELETE FROM drafts WHERE draft_id=?", (d["draft_id"],))
+        preview = transcripts.reextract_preview(self.conn, tid)
+        self.assertEqual(sorted((r["source_quote"], r["kind"], r["rule_id"]) for r in preview["added"]), sorted([
+            (MIXED_EXPLICIT_TODO, "決議", "D7"), (MIXED_EXPLICIT_DECISION, "待辦", "T4")]))
+        self.assertEqual(transcripts.reextract_apply(self.conn, tid)["added_count"], 2)
+        self.assertEqual(transcripts.reextract_apply(self.conn, tid)["added_count"], 0)
+        self.assertEqual(len(self.drafts(tid)), 4)
 
 
 class TestReextractPair(Base):
