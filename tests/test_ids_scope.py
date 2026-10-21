@@ -79,6 +79,28 @@ class TestIssueIdNeverReused(unittest.TestCase):
         self.conn = db.connect(self.path)
         self.assertEqual(self.add(), "SDT-0010")
 
+    def test_upgrade_from_version_2_without_retired_table(self):
+        # 版本 2（81814e6）的資料庫：有 id_counters，沒有 retired_issue_ids
+        ids = [self.add() for _ in range(3)]
+        db.delete_issue(self.conn, ids[-1], "u")
+        self.conn.execute("DROP TABLE retired_issue_ids")
+        self.conn.execute("PRAGMA user_version=2")
+        self.conn.commit()
+        issues_before = [dict(r) for r in self.conn.execute("SELECT * FROM issues ORDER BY issue_id")]
+        history_before = db.get_history(self.conn)
+        self.conn.close()
+        self.conn = db.connect(self.path)
+        self.assertEqual(self.conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        self.assertEqual(db.SCHEMA_VERSION, 3)
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='retired_issue_ids'").fetchone())
+        self.assertEqual([dict(r) for r in self.conn.execute("SELECT * FROM issues ORDER BY issue_id")],
+                         issues_before)
+        self.assertEqual(db.get_history(self.conn), history_before)
+        self.assertEqual(self.add(), "SDT-0004")
+        db.wipe_all(self.conn)
+        self.assertEqual(self.add(), "SDT-0005")
+
     def test_reused_history_is_reported_not_rewritten(self):
         self.add()
         self.add()
@@ -143,7 +165,7 @@ class TestIssueIdNeverReused(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("SDT-0002", out)
         self.assertEqual(digest(), before)
-        # WAL 模式的資料庫，SQLite 唯讀開啟時可能建立 -wal／-shm 輔助檔；-wal 必須是空的（沒有寫入）
+        # 本測試沒有其他連線：SQLite 唯讀開啟可能建立 -wal／-shm 輔助檔，此時新建的 -wal 應為空
         wal = cfg.db_path.with_name(cfg.db_path.name + "-wal")
         if wal.exists():
             self.assertEqual(wal.stat().st_size, 0)

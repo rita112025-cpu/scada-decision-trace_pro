@@ -232,7 +232,7 @@ def migrate(conn):
 
 
 # 結構有變就加 1。已是這個版本的資料庫不再每次連線都跑建表與遷移。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def connect(path):
