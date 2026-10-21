@@ -352,14 +352,22 @@ _CREATE_ACTIONS = ("create", "import", "sample", "confirm-draft")
 
 # 計數器存在 SQLite INTEGER（有號 64 位元）。舊版 CSV 可匯入任意長度的數字編號，
 # 超過此上限的編號不納入計數器；是否已用過仍由 issues／issue_history 逐筆比對。
+# 前導零不影響數值（SDT-007 與 SDT-0007 都算 7）。
 _ISSUE_NUMBER_MAX = 2 ** 62
+
+
+_ISSUE_NUMBER_MAX_DIGITS = len(str(_ISSUE_NUMBER_MAX))
 
 
 def _issue_number(issue_id):
     m = _ISSUE_ID_RE.fullmatch(issue_id or "")
     if not m:
         return 0
-    n = int(m[1])
+    # 先去掉前導零、用位數判斷上限，再轉整數：超長字串直接 int() 會撞到 Python 的位數限制
+    digits = m[1].lstrip("0")
+    if len(digits) > _ISSUE_NUMBER_MAX_DIGITS:
+        return 0
+    n = int(digits or "0")
     return n if n <= _ISSUE_NUMBER_MAX else 0
 
 

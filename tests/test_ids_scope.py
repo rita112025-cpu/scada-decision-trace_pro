@@ -116,6 +116,36 @@ class TestIssueIdNeverReused(unittest.TestCase):
         self.assertEqual(self.add(), "SDT-0002")
         db.get_issue(self.conn, big)
 
+    def _upgrade_with_legacy_id(self, legacy):
+        db.create_issue(self.conn, issue(), "u", issue_id=legacy)
+        self.conn.execute("DROP TABLE id_counters")
+        self.conn.execute("DROP TABLE retired_issue_ids")
+        self.conn.execute("PRAGMA user_version=1")
+        self.conn.commit()
+        self.conn.close()
+        self.conn = db.connect(self.path)
+        self.assertEqual(self.conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        self.assertEqual(db.get_issue(self.conn, legacy)["issue_id"], legacy)
+
+    def test_upgrade_with_5000_digit_legacy_id(self):
+        # 超過 Python 預設 4300 位數的整數轉換限制
+        self._upgrade_with_legacy_id("SDT-" + "9" * 5000)
+        self.assertEqual(self.add(), "SDT-0001")
+        self.assertEqual(self.add(), "SDT-0002")
+
+    def test_upgrade_with_many_leading_zeros(self):
+        # 前導零不影響數值：視為 7，下一號是 8
+        self._upgrade_with_legacy_id("SDT-" + "0" * 5000 + "7")
+        self.assertEqual(self.add(), "SDT-0008")
+
+    def test_issue_number_bounds(self):
+        self.assertEqual(db._issue_number("SDT-0007"), 7)
+        self.assertEqual(db._issue_number("SDT-" + "0" * 5000), 0)
+        self.assertEqual(db._issue_number(f"SDT-{db._ISSUE_NUMBER_MAX}"), db._ISSUE_NUMBER_MAX)
+        self.assertEqual(db._issue_number(f"SDT-{db._ISSUE_NUMBER_MAX + 1}"), 0)
+        self.assertEqual(db._issue_number("SDT-" + "1" * 5000), 0)
+        self.assertEqual(db._issue_number("ABC-0001"), 0)
+
     def test_oversized_explicit_id_does_not_break_numbering(self):
         big = "SDT-99999999999999999999"
         db.create_issue(self.conn, issue(), "u", issue_id=big)
