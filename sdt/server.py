@@ -295,6 +295,13 @@ def make_handler(app):
             if route == ("GET", "transcripts") and len(parts) == 1:
                 with app.conn() as conn:
                     return self._json(200, {"items": transcripts.list_transcripts(conn, query.get("project_id", ""))})
+            if route == ("GET", "transcripts") and len(parts) == 3 and parts[2] == "sentences":
+                with app.conn() as conn:
+                    return self._json(200, transcripts.source_sentences(conn, parts[1]))
+            if route == ("POST", "transcripts") and len(parts) == 3 and parts[2] == "manual-drafts":
+                data = self._json_body()
+                with app.lock, app.conn() as conn:
+                    return self._json(201, transcripts.create_manual_draft(conn, parts[1], data))
             if route == ("GET", "transcripts") and len(parts) == 3 and parts[2] == "segments":
                 with app.conn() as conn:
                     return self._json(200, {"items": transcripts.list_segments(conn, parts[1])})
