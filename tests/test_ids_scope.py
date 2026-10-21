@@ -101,6 +101,31 @@ class TestIssueIdNeverReused(unittest.TestCase):
         db.wipe_all(self.conn)
         self.assertEqual(self.add(), "SDT-0005")
 
+    def test_upgrade_with_oversized_legacy_id(self):
+        # 舊版可由 CSV 匯入超過 64 位元整數的編號；升級不得因此無法開啟
+        big = "SDT-12345678901234567890"
+        db.create_issue(self.conn, issue(), "u", issue_id=big)
+        self.add()
+        self.conn.execute("DROP TABLE id_counters")
+        self.conn.execute("DROP TABLE retired_issue_ids")
+        self.conn.execute("PRAGMA user_version=1")
+        self.conn.commit()
+        self.conn.close()
+        self.conn = db.connect(self.path)
+        self.assertEqual(self.conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
+        self.assertEqual(self.add(), "SDT-0002")
+        db.get_issue(self.conn, big)
+
+    def test_oversized_explicit_id_does_not_break_numbering(self):
+        big = "SDT-99999999999999999999"
+        db.create_issue(self.conn, issue(), "u", issue_id=big)
+        self.assertEqual(self.add(), "SDT-0001")
+        db.delete_issue(self.conn, big, "u")
+        with self.assertRaises(db.ValidationError):
+            db.create_issue(self.conn, issue(), "u", issue_id=big)
+        db.wipe_all(self.conn)
+        self.assertEqual(self.add(), "SDT-0002")
+
     def test_reused_history_is_reported_not_rewritten(self):
         self.add()
         self.add()

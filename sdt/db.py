@@ -350,9 +350,17 @@ _REMOVE_ACTIONS = ("delete", "clear-sample")
 _CREATE_ACTIONS = ("create", "import", "sample", "confirm-draft")
 
 
+# 計數器存在 SQLite INTEGER（有號 64 位元）。舊版 CSV 可匯入任意長度的數字編號，
+# 超過此上限的編號不納入計數器；是否已用過仍由 issues／issue_history 逐筆比對。
+_ISSUE_NUMBER_MAX = 2 ** 62
+
+
 def _issue_number(issue_id):
     m = _ISSUE_ID_RE.fullmatch(issue_id or "")
-    return int(m[1]) if m else 0
+    if not m:
+        return 0
+    n = int(m[1])
+    return n if n <= _ISSUE_NUMBER_MAX else 0
 
 
 def _max_used_issue_number(conn):
