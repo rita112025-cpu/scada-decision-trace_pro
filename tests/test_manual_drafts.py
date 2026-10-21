@@ -104,6 +104,28 @@ class TestCreate(Base):
         self.assertEqual(len(self.drafts()), len(self.rule_drafts))
 
 
+class TestSentenceIndexNormalized(Base):
+    def test_leading_zero_is_normalized_and_occupies_position(self):
+        rule = self.rule_drafts[0]
+        transcripts.delete_draft(self.conn, rule["draft_id"])
+        d = self.manual(1, "01", "決議")["draft"]
+        self.assertEqual(d["sentence_index"], "1")
+        listed = transcripts.source_sentences(self.conn, self.tid)["segments"][1]["sentences"][0]["drafts"]
+        self.assertEqual([x["draft_id"] for x in listed], [d["draft_id"]])
+        for _ in range(2):
+            self.assertEqual(transcripts.reextract_preview(self.conn, self.tid)["added_count"], 0)
+            self.assertEqual(transcripts.reextract_apply(self.conn, self.tid)["added_count"], 0)
+        self.assertEqual([x["draft_id"] for x in self.drafts()], [d["draft_id"]])
+
+    def test_invalid_indexes_are_validation_errors(self):
+        seg = self.segments[0]["segment_id"]
+        for value in ("１", "²", "9" * 5000, "0000001" , "-1", "1.0", " 1 x", None):
+            with self.assertRaises(db.ValidationError, msg=repr(value)[:20]):
+                transcripts.create_manual_draft(self.conn, self.tid, {
+                    "segment_id": seg, "sentence_index": value, "kind": "待辦", "summary": "x"})
+        self.assertEqual(len(self.drafts()), len(self.rule_drafts))
+
+
 class TestDuplicatePrompt(Base):
     def test_same_segment_same_kind_needs_confirm(self):
         with self.assertRaises(transcripts.NeedsChoice) as ctx:
@@ -237,6 +259,9 @@ class TestServer(unittest.TestCase):
         self.assertEqual(res["draft"]["extraction_method"], "manual")
         s, res = self.req("POST", f"/api/transcripts/{self.tid}/manual-drafts", dict(body, summary=""))
         self.assertEqual(s, 400)
+        s, res = self.req("POST", f"/api/transcripts/{self.tid}/manual-drafts", dict(body, sentence_index="１"))
+        self.assertEqual(s, 400)
+        self.assertEqual(res["errors"], ["請選擇這個段落裡的一句原文"])
         s, res = self.req("GET", "/api/transcripts/TR-9999/sentences")
         self.assertEqual(s, 404)
 

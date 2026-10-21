@@ -1899,10 +1899,13 @@ def create_manual_draft(conn, transcript_id, data, *, now=None):
     if kind not in ("決議", "待辦"):
         raise db.ValidationError(["類型只能是「決議」或「待辦」"])
     segment = get_segment(conn, transcript_id, db._clean_text(data.get("segment_id")))
-    sentence_index = db._clean_text(data.get("sentence_index"))
+    raw_index = db._clean_text(data.get("sentence_index"))
     sentences = _sentences(segment.get("text") or "")
-    if not sentence_index.isdigit() or not 1 <= int(sentence_index) <= len(sentences):
+    # 只收半形數字且限制長度，再轉成整數存成 "1"、"2"…，與規則候選的句序寫法一致，
+    # 否則 "01"、全形數字會對不上同一句，重新抽取會再補一筆。
+    if not re.fullmatch(r"[0-9]{1,6}", raw_index) or not 1 <= int(raw_index) <= len(sentences):
         raise db.ValidationError(["請選擇這個段落裡的一句原文"])
+    sentence_index = str(int(raw_index))
     summary = db._clean_text(data.get("summary"))
     if not summary:
         raise db.ValidationError(["摘要不可空白，請自行填寫"])
