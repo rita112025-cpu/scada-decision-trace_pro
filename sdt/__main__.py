@@ -130,8 +130,16 @@ def cmd_agenda(cfg, args):
 
 
 def cmd_check_ids(cfg, args):
-    with db.session(cfg.db_path) as conn:
+    # 唯讀連線：不建檔、不遷移、不寫入，舊版資料庫也維持原樣
+    try:
+        conn = db.connect_readonly(cfg.db_path)
+    except FileNotFoundError:
+        print(f"錯誤：找不到資料庫 {cfg.db_path}")
+        return 1
+    try:
         ids = db.reused_issue_ids(conn)
+    finally:
+        conn.close()
     if not ids:
         print("變更紀錄中沒有發現「刪除後又建立」的重複編號")
         return 0

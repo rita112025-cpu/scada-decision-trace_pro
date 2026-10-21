@@ -1,5 +1,6 @@
 """SQLite 資料層：事項 CRUD、驗證規則、變更紀錄、視圖篩選。"""
 import datetime as dt
+import pathlib
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -74,6 +75,9 @@ EXTRA_SCHEMA = """
 CREATE TABLE IF NOT EXISTS id_counters (
     name TEXT PRIMARY KEY,
     last_value INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS retired_issue_ids (
+    issue_id TEXT PRIMARY KEY
 );
 CREATE TABLE IF NOT EXISTS projects (
     project_id TEXT PRIMARY KEY,
@@ -343,7 +347,7 @@ def get_issue(conn, issue_id):
 ISSUE_PREFIX = "SDT-"
 _ISSUE_ID_RE = re.compile(r"SDT-(\d+)")
 _REMOVE_ACTIONS = ("delete", "clear-sample")
-_CREATE_ACTIONS = ("create", "import", "sample")
+_CREATE_ACTIONS = ("create", "import", "sample", "confirm-draft")
 
 
 def _issue_number(issue_id):
@@ -352,9 +356,9 @@ def _issue_number(issue_id):
 
 
 def _max_used_issue_number(conn):
-    """掃描 issues 與 issue_history，找出曾經用過的最大 SDT- 編號。"""
+    """掃描 issues、issue_history 與清空時留下的已用編號，找出曾經用過的最大 SDT- 編號。"""
     best = 0
-    for table in ("issues", "issue_history"):
+    for table in ("issues", "issue_history", "retired_issue_ids"):
         for row in conn.execute(f"SELECT DISTINCT issue_id FROM {table} WHERE issue_id GLOB 'SDT-[0-9]*'"):
             best = max(best, _issue_number(row[0]))
     return best
@@ -369,9 +373,15 @@ def seed_issue_counter(conn):
         " ON CONFLICT(name) DO UPDATE SET last_value=excluded.last_value", (value,))
 
 
+def _issue_id_retired(conn, issue_id):
+    """編號曾經用過但事項已不在：變更紀錄有它，或清空全部資料時登記過。"""
+    return bool(conn.execute("SELECT 1 FROM issue_history WHERE issue_id=? LIMIT 1", (issue_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM retired_issue_ids WHERE issue_id=?", (issue_id,)).fetchone())
+
+
 def _issue_id_used(conn, issue_id):
     return bool(conn.execute("SELECT 1 FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
-                or conn.execute("SELECT 1 FROM issue_history WHERE issue_id=? LIMIT 1", (issue_id,)).fetchone())
+                or _issue_id_retired(conn, issue_id))
 
 
 def _next_issue_id(conn):
@@ -387,6 +397,16 @@ def _set_issue_counter(conn, n):
     conn.execute(
         "INSERT INTO id_counters(name, last_value) VALUES('issue', ?)"
         " ON CONFLICT(name) DO UPDATE SET last_value=MAX(last_value, excluded.last_value)", (n,))
+
+
+def connect_readonly(path):
+    """唯讀連線：不建檔、不建表、不遷移。資料庫不存在時丟 FileNotFoundError。"""
+    path = pathlib.Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def reused_issue_ids(conn):
@@ -506,7 +526,7 @@ def create_issue(conn, data, operator, *, now=None, action="create", is_sample=F
     issue_id = _clean_text(issue_id or data.get("issue_id")) or _next_issue_id(conn)
     if conn.execute("SELECT 1 FROM issues WHERE issue_id=?", (issue_id,)).fetchone():
         raise ValidationError([f"事項編號 {issue_id} 已存在"])
-    if conn.execute("SELECT 1 FROM issue_history WHERE issue_id=? LIMIT 1", (issue_id,)).fetchone():
+    if _issue_id_retired(conn, issue_id):
         raise ValidationError([f"事項編號 {issue_id} 曾經使用過（已刪除），不能重新建立。請清空編號欄位讓系統配新號"])
     if _issue_number(issue_id):
         _set_issue_counter(conn, _issue_number(issue_id))
@@ -702,11 +722,18 @@ def delete_issue(conn, issue_id, operator, *, now=None):
 
 
 def wipe_all(conn):
-    """清空台帳、逐字稿、草稿與專案。呼叫端須先做好備份。不刪備份檔，也不碰磁碟上的原始 TXT。"""
+    """清空台帳、逐字稿、草稿與專案。呼叫端須先做好備份。不刪備份檔，也不碰磁碟上的原始 TXT。
+
+    編號計數器與已用編號登記不清除，清空後新事項與 CSV 都不會重新用到舊編號。
+    """
+    conn.execute(
+        """INSERT OR IGNORE INTO retired_issue_ids(issue_id)
+           SELECT issue_id FROM issues UNION SELECT issue_id FROM issue_history""")
+    seed_issue_counter(conn)
     counts = {}
     for table in (
         "document_links", "extraction_runs", "drafts", "transcript_segments",
-        "transcripts", "issues", "issue_history", "projects", "id_counters",
+        "transcripts", "issues", "issue_history", "projects",
     ):
         counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         conn.execute(f"DELETE FROM {table}")

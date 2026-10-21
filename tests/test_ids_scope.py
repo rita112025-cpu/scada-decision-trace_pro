@@ -95,29 +95,87 @@ class TestIssueIdNeverReused(unittest.TestCase):
         self.add()
         self.assertEqual(db.reused_issue_ids(self.conn), [])
 
-    def test_check_ids_cli_is_read_only(self):
+    def _cli_cfg(self):
+        cfg = config.Config(operator="u", port=0, data_dir=pathlib.Path(self.tmp.name) / "cli")
+        cfg.data_dir.mkdir(exist_ok=True)
+        return cfg
+
+    def _run_check_ids(self, cfg):
         import contextlib
         import io
         from sdt import __main__ as cli
-        cfg = config.Config(operator="u", port=0, data_dir=pathlib.Path(self.tmp.name) / "cli")
-        cfg.data_dir.mkdir()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.cmd_check_ids(cfg, None)
+        return code, out.getvalue()
+
+    def _seed_reused(self, cfg, action):
         with db.session(cfg.db_path) as conn:
             db.create_issue(conn, issue(), "u")
             db.create_issue(conn, issue(), "u")
             db.delete_issue(conn, "SDT-0002", "u")
-            db._log(conn, "SDT-0002", "2026-01-02 00:00:00", "u", "create", "title", "", "新事項")
-            before = db.get_history(conn)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertEqual(cli.cmd_check_ids(cfg, None), 0)
-        self.assertIn("SDT-0002", out.getvalue())
-        with db.session(cfg.db_path) as conn:
-            self.assertEqual(db.get_history(conn), before)
+            # 模擬舊版行為：刪除後同一編號又被配給新事項
+            db._log(conn, "SDT-0002", "2026-01-02 00:00:00", "u", action, "title", "", "新事項")
 
-    def test_wipe_all_resets_counter(self):
+    def test_check_ids_cli_reports_reuse(self):
+        cfg = self._cli_cfg()
+        self._seed_reused(cfg, "create")
+        code, out = self._run_check_ids(cfg)
+        self.assertEqual(code, 0)
+        self.assertIn("SDT-0002", out)
+
+    def test_check_ids_reports_confirm_draft_reuse(self):
+        cfg = self._cli_cfg()
+        self._seed_reused(cfg, "confirm-draft")
+        self.assertIn("SDT-0002", self._run_check_ids(cfg)[1])
+
+    def test_check_ids_does_not_touch_old_database(self):
+        import hashlib
+        cfg = self._cli_cfg()
+        self._seed_reused(cfg, "create")
+        with db.session(cfg.db_path) as conn:
+            conn.execute("DROP TABLE id_counters")
+            conn.execute("DROP TABLE retired_issue_ids")
+            conn.execute("PRAGMA user_version=1")
+        digest = lambda: hashlib.sha256(cfg.db_path.read_bytes()).hexdigest()
+        before = digest()
+        code, out = self._run_check_ids(cfg)
+        self.assertEqual(code, 0)
+        self.assertIn("SDT-0002", out)
+        self.assertEqual(digest(), before)
+        # WAL 模式的資料庫，SQLite 唯讀開啟時可能建立 -wal／-shm 輔助檔；-wal 必須是空的（沒有寫入）
+        wal = cfg.db_path.with_name(cfg.db_path.name + "-wal")
+        if wal.exists():
+            self.assertEqual(wal.stat().st_size, 0)
+        ro = db.connect_readonly(cfg.db_path)
+        try:
+            self.assertEqual(ro.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertIsNone(ro.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='id_counters'").fetchone())
+        finally:
+            ro.close()
+
+    def test_check_ids_missing_database_is_error_and_not_created(self):
+        cfg = self._cli_cfg()
+        code, out = self._run_check_ids(cfg)
+        self.assertEqual(code, 1)
+        self.assertIn("找不到資料庫", out)
+        self.assertFalse(cfg.db_path.exists())
+
+    def test_wipe_all_keeps_counter(self):
+        self.add()
         self.add()
         db.wipe_all(self.conn)
-        self.assertEqual(self.add(), "SDT-0001")
+        self.assertEqual(self.add(), "SDT-0003")
+
+    def test_wipe_all_blocks_csv_old_ids(self):
+        self.add()
+        db.wipe_all(self.conn)
+        data = csvio.export_issues([dict(issue(), issue_id="SDT-0001")])
+        with self.assertRaises(db.ValidationError) as ctx:
+            csvio.import_issues(self.conn, data, "u")
+        self.assertIn("曾經使用過", " ".join(ctx.exception.errors))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM issues").fetchone()[0], 0)
 
 
 class TestProjectScope(unittest.TestCase):
