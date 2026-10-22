@@ -82,8 +82,9 @@ def parse(data):
         for line_no, raw in enumerate(reader, start=2):
             if not any(cell.strip() for cell in raw):
                 continue
-            if len(raw) != len(keys):
-                raise db.ValidationError([f"第 {line_no} 列：欄位數與標題列不符（應為 {len(keys)} 欄，實際 {len(raw)} 欄）"])
+            if len(raw) > len(keys):
+                raise db.ValidationError([f"第 {line_no} 列：欄位數超過標題列（最多 {len(keys)} 欄，實際 {len(raw)} 欄）"])
+            raw = raw + [""] * (len(keys) - len(raw))  # 部分工具會省略行尾空欄
             row = {k: _unescape(v) for k, v in zip(keys, raw) if k}
             rows.append((line_no, row))
     except csv.Error:

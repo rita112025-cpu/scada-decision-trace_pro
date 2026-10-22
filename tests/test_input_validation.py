@@ -15,7 +15,6 @@ class TestCsvStructure(unittest.TestCase):
         cases = (
             '標題,title\n第一欄,被覆蓋的標題\n',
             '標題,描述\n正常,保留\n錯誤,描述,多出的內容\n',
-            '標題,描述\n正常,保留\n錯誤\n',
             '標題,描述\n正常,保留\n錯誤,"未結束\n',
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -29,6 +28,14 @@ class TestCsvStructure(unittest.TestCase):
                         self.assertEqual([r['issue_id'] for r in db.list_issues(conn)],
                                          [original['issue_id']])
                         self.assertEqual(db.get_history(conn), history)
+
+
+class TestCsvShortRows(unittest.TestCase):
+    def test_trailing_empty_cells_may_be_omitted(self):
+        rows = csvio.parse('標題,描述\n只有標題\n有描述,內容\n'.encode('utf-8'))
+        self.assertEqual([r['title'] for _, r in rows], ['只有標題', '有描述'])
+        self.assertEqual(rows[0][1].get('description', ''), '')
+        self.assertEqual(rows[1][1]['description'], '內容')
 
 
 class TestHttpInput(unittest.TestCase):
