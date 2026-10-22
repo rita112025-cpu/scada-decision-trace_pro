@@ -61,23 +61,33 @@ def decode(data):
 
 def parse(data):
     text, _ = decode(data)
-    reader = csv.reader(io.StringIO(text, newline=""))
+    reader = csv.reader(io.StringIO(text, newline=""), strict=True)
     try:
         header = next(reader)
     except StopIteration:
         raise db.ValidationError(["CSV 是空的"])
+    except csv.Error:
+        raise db.ValidationError(["CSV 標題列格式錯誤，請檢查引號與欄位"])
     keys = [_HEADER_TO_KEY.get(h.strip()) for h in header]
     unknown = [h for h, k in zip(header, keys) if k is None and h.strip()]
     if unknown:
         raise db.ValidationError([f"無法辨識的欄位：{'、'.join(unknown)}"])
     if "title" not in keys:
         raise db.ValidationError(["缺少「標題」欄位"])
+    present = [k for k in keys if k]
+    if len(present) != len(set(present)):
+        raise db.ValidationError(["CSV 欄位重複，中文與英文同名欄位只能保留一個"])
     rows = []
-    for line_no, raw in enumerate(reader, start=2):
-        if not any(cell.strip() for cell in raw):
-            continue
-        row = {k: _unescape(v) for k, v in zip(keys, raw) if k}
-        rows.append((line_no, row))
+    try:
+        for line_no, raw in enumerate(reader, start=2):
+            if not any(cell.strip() for cell in raw):
+                continue
+            if len(raw) != len(keys):
+                raise db.ValidationError([f"第 {line_no} 列：欄位數與標題列不符（應為 {len(keys)} 欄，實際 {len(raw)} 欄）"])
+            row = {k: _unescape(v) for k, v in zip(keys, raw) if k}
+            rows.append((line_no, row))
+    except csv.Error:
+        raise db.ValidationError([f"CSV 格式錯誤（第 {reader.line_num} 行附近），請檢查引號與欄位"])
     return rows
 
 
@@ -144,3 +154,4 @@ def import_issues(conn, data, operator, now=None):
     conn.execute("RELEASE import_csv")
     return {"created": created, "updated": updated, "unchanged": len(rows) - created - updated,
             "warnings": warnings}
+

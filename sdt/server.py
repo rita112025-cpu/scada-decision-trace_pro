@@ -50,7 +50,16 @@ def make_handler(app):
                        "application/json; charset=utf-8")
 
         def _body(self):
-            length = int(self.headers.get("Content-Length") or 0)
+            lengths = self.headers.get_all("Content-Length", [])
+            text = lengths[0].strip() if lengths else "0"
+            if (len(lengths) > 1 or self.headers.get("Transfer-Encoding") is not None
+                    or not text.isascii() or not text.isdecimal()):
+                raise db.ValidationError(["請求長度無效，請使用單一 Content-Length"])
+            # 先比較位數，避免極長整數轉換產生未處理的錯誤。
+            text = text.lstrip("0") or "0"
+            if len(text) > 8:
+                raise db.ValidationError(["上傳內容過大（上限 20MB）"])
+            length = int(text)
             if length > 20 * 1024 * 1024:
                 raise db.ValidationError(["上傳內容過大（上限 20MB）"])
             return self.rfile.read(length) if length else b""
@@ -58,9 +67,12 @@ def make_handler(app):
         def _json_body(self):
             raw = self._body()
             try:
-                return json.loads(raw.decode("utf-8")) if raw else {}
+                value = json.loads(raw.decode("utf-8")) if raw else {}
             except (UnicodeDecodeError, json.JSONDecodeError):
                 raise db.ValidationError(["請求內容不是有效的 JSON"])
+            if not isinstance(value, dict):
+                raise db.ValidationError(["請求 JSON 必須是物件"])
+            return value
 
         def _same_origin(self):
             """擋掉其他網站對本機服務發出的寫入請求（CSRF / DNS rebinding）。"""
@@ -378,3 +390,4 @@ def make_server(cfg, port=None, today_fn=db.today_str):
     app = App(cfg, today_fn)
     db.connect(cfg.db_path).close()  # 建立資料表
     return ThreadingHTTPServer(("127.0.0.1", cfg.port if port is None else port), make_handler(app))
+
