@@ -302,24 +302,6 @@ def make_handler(app):
             if route == ("GET", "transcripts") and len(parts) == 3 and parts[2] == "delete-preview":
                 with app.lock, app.conn() as conn:
                     return self._json(200, transcripts.deletion_preview(conn, parts[1]))
-            if route == ("GET", "transcripts") and len(parts) == 3 and parts[2] == "meeting-results":
-                with app.conn() as conn:
-                    result = transcripts.meeting_results(conn, parts[1])
-                    result["quality_preview"] = transcripts.quality_repair_preview(conn, parts[1])
-                    result["markdown"] = transcripts.meeting_results_markdown(result)
-                    return self._json(200, result)
-            if route == ("POST", "transcripts") and len(parts) == 3 and parts[2] == "analyze-local":
-                data = self._json_body()
-                with app.conn() as conn:
-                    result = transcripts.analyze_local_ollama(
-                        conn, parts[1], app.cfg.local_llm_url, app.cfg.local_llm_model,
-                        timeout=min(180, max(1, int(data.get("timeout", 120)))))
-                    return self._json(200, result)
-            if route == ("POST", "transcripts") and len(parts) == 3 and parts[2] == "outcomes":
-                data = self._json_body()
-                with app.lock, app.conn() as conn:
-                    result = transcripts.save_local_outcome(conn, parts[1], data.get("item"))
-                    return self._json(201 if result["created"] else 200, result)
             if route == ("DELETE", "transcripts") and len(parts) == 2:
                 data = self._json_body()
                 if data.get("confirm") is not True or not isinstance(data.get("preview_token"), str):
