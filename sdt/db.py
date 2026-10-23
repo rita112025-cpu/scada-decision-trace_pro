@@ -37,6 +37,12 @@ FIELDS = [
     ("acceptance_evidence", "驗收證據路徑"),
     ("created_at", "建立時間"),
     ("updated_at", "更新時間"),
+    ("source_checked", "原文依據已人工核對"),
+    ("audio_checked", "音檔已人工核對"),
+    ("source_audio_id", "來源音檔識別碼"),
+    ("source_audio", "來源音檔"),
+    ("source_time", "來源時間碼"),
+    ("source_evidence_json", "來源段落清單 JSON"),
 ]
 FIELD_LABELS = dict(FIELDS)
 SYSTEM_FIELDS = ("issue_id", "created_at", "updated_at")
@@ -104,6 +110,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
     segment_count INTEGER NOT NULL,
     timestamp_status TEXT NOT NULL,
     timestamp_detail TEXT NOT NULL DEFAULT '',
+    metadata TEXT NOT NULL DEFAULT '{}',
     UNIQUE(project_id, content_hash)
 );
 
@@ -120,6 +127,12 @@ CREATE TABLE IF NOT EXISTS transcript_segments (
     end_seconds TEXT NOT NULL DEFAULT '',
     timestamp_label TEXT NOT NULL,
     timestamp_source TEXT NOT NULL DEFAULT '',
+    raw_timecode TEXT NOT NULL DEFAULT '',
+    time_parse_status TEXT NOT NULL DEFAULT 'no_time',
+    source_id TEXT NOT NULL DEFAULT '',
+    source_audio TEXT NOT NULL DEFAULT '',
+    source_checked INTEGER NOT NULL DEFAULT 0,
+    audio_checked INTEGER NOT NULL DEFAULT 0,
     line_start INTEGER,
     line_end INTEGER,
     edited INTEGER NOT NULL DEFAULT 0
@@ -143,6 +156,8 @@ CREATE TABLE IF NOT EXISTS drafts (
     due_origin TEXT NOT NULL DEFAULT '未指定',
     review_status TEXT NOT NULL,
     issue_id TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    outcome_json TEXT NOT NULL DEFAULT '{}',
     rule_id TEXT NOT NULL DEFAULT '',
     reason TEXT NOT NULL DEFAULT '',
     review_gaps TEXT NOT NULL DEFAULT '',
@@ -213,6 +228,29 @@ def migrate(conn):
     for col in TRACE_COLUMNS:
         if col not in cols:
             conn.execute(f"ALTER TABLE issues ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    for col in ("source_checked", "audio_checked", "source_audio_id", "source_audio", "source_time"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE issues ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    issue_cols = _table_columns(conn, "issues")
+    if "source_evidence_json" not in issue_cols:
+        conn.execute("ALTER TABLE issues ADD COLUMN source_evidence_json TEXT NOT NULL DEFAULT '[]'")
+    draft_cols = _table_columns(conn, "drafts")
+    if "evidence_json" not in draft_cols:
+        conn.execute("ALTER TABLE drafts ADD COLUMN evidence_json TEXT NOT NULL DEFAULT '[]'")
+    if "outcome_json" not in draft_cols:
+        conn.execute("ALTER TABLE drafts ADD COLUMN outcome_json TEXT NOT NULL DEFAULT '{}'")
+    segment_cols = _table_columns(conn, "transcript_segments")
+    for col, definition in (("source_id", "TEXT NOT NULL DEFAULT ''"),
+                            ("source_audio", "TEXT NOT NULL DEFAULT ''"),
+                            ("raw_timecode", "TEXT NOT NULL DEFAULT ''"),
+                            ("time_parse_status", "TEXT NOT NULL DEFAULT 'no_time'"),
+                            ("source_checked", "INTEGER NOT NULL DEFAULT 0"),
+                            ("audio_checked", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in segment_cols:
+            conn.execute(f"ALTER TABLE transcript_segments ADD COLUMN {col} {definition}")
+    transcript_cols = _table_columns(conn, "transcripts")
+    if "metadata" not in transcript_cols:
+        conn.execute("ALTER TABLE transcripts ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
     link_cols = _table_columns(conn, "document_links")
     if "file_hash" not in link_cols:
         conn.execute("ALTER TABLE document_links ADD COLUMN file_hash TEXT NOT NULL DEFAULT ''")
@@ -236,6 +274,8 @@ SCHEMA_VERSION = 3
 
 
 def connect(path):
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
@@ -243,11 +283,40 @@ def connect(path):
     conn.execute("PRAGMA journal_mode=WAL").fetchone()
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version < SCHEMA_VERSION:
+        if _needs_schema_backup(conn):
+            backup_dir = path.parent / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            backup_path = backup_dir / f"{path.stem}.pre-schema-migration-{stamp}.db"
+            backup_conn = sqlite3.connect(backup_path)
+            try:
+                conn.backup(backup_conn)
+            finally:
+                backup_conn.close()
         conn.executescript(SCHEMA)
         migrate(conn)
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         conn.commit()
     return conn
+
+
+def _needs_schema_backup(conn):
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not tables:
+        return False
+    if "issues" in tables and not {"projects", "transcripts", "transcript_segments", "drafts"}.issubset(tables):
+        return True
+    required = {
+        "issues": set(EDITABLE_FIELDS) | set(TRACE_COLUMNS),
+        "transcripts": {"metadata"},
+        "transcript_segments": {"source_id", "source_audio", "raw_timecode", "time_parse_status",
+                                "source_checked", "audio_checked"},
+        "drafts": {"evidence_json", "outcome_json"},
+    }
+    for table, columns in required.items():
+        if table in tables and not columns.issubset(_table_columns(conn, table)):
+            return True
+    return False
 
 
 @contextmanager
@@ -306,6 +375,10 @@ def normalize(data):
                          ("acceptance_result", ACCEPTANCE_RESULTS)):
         if clean[key] not in allowed:
             errors.append(f"{FIELD_LABELS[key]}「{clean[key]}」不是有效值")
+    for key in ("source_checked", "audio_checked"):
+        clean[key] = clean[key] or "未核對"
+        if clean[key] not in ("未核對", "已核對"):
+            errors.append(f"{FIELD_LABELS[key]}必須是「未核對」或「已核對」")
     try:
         clean["due_date"] = parse_date(clean["due_date"])
     except ValueError:
@@ -688,6 +761,40 @@ def list_issues(conn, *, view="all", q="", filters=None, sort="due_date", order=
 def view_counts(conn, today=None, project_id=""):
     filters = {"project_id": project_id} if project_id else None
     return {v: len(list_issues(conn, view=v, today=today, filters=filters)) for v in VIEWS}
+
+
+def delete_issue(conn, issue_id, operator, *, now=None):
+    """刪除一筆台帳事項，並在變更紀錄留下刪除。不刪磁碟上的檔案。
+
+    若事項來自草稿，該草稿回到未入帳，逐字稿本身不刪。文件關聯只刪資料庫裡的連結。
+    """
+    issue = get_issue(conn, issue_id)
+    when = now or now_str()
+    _log(conn, issue_id, when, operator, "delete", "issue_id", issue_id, "")
+    _log(conn, issue_id, when, operator, "delete", "title", issue.get("title") or "", "")
+    link_count = conn.execute(
+        "SELECT COUNT(*) FROM document_links WHERE issue_id=?", (issue_id,)).fetchone()[0]
+    if link_count:
+        _log(conn, issue_id, when, operator, "delete", "document_links", str(link_count), "0")
+        conn.execute("DELETE FROM document_links WHERE issue_id=?", (issue_id,))
+    draft_id = issue.get("draft_id") or ""
+    draft_reverted = False
+    if draft_id:
+        cur = conn.execute(
+            """UPDATE drafts SET review_status='草稿', issue_id='', updated_at=?
+               WHERE draft_id=? AND issue_id=? AND review_status='已確認'""",
+            (when, draft_id, issue_id))
+        draft_reverted = cur.rowcount > 0
+        if draft_reverted:
+            _log(conn, issue_id, when, operator, "delete", "draft_id", draft_id, "")
+    conn.execute("DELETE FROM issues WHERE issue_id=?", (issue_id,))
+    return {
+        "deleted": True,
+        "issue_id": issue_id,
+        "draft_reverted": draft_reverted,
+        "links_removed": link_count,
+        "message": f"已刪除事項 {issue_id}。變更紀錄已保留刪除紀錄，沒有刪磁碟上的檔案。",
+    }
 
 
 def clear_sample(conn, operator):

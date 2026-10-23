@@ -14,41 +14,28 @@
     <p class="sub">本機資料 · 操作者:<span id="operator">-</span> · 今天:<span id="today">-</span></p>
   </div>
   <div class="actions">
-    <button id="btn-new" class="primary" type="button">＋ 新增事項</button>
+    <button id="btn-transcripts" type="button">已匯入逐字稿</button>
+    <button id="btn-drafts" type="button">審核草稿 <span id="draft-count" class="count-badge">0</span></button>
     <button id="btn-import" type="button">匯入逐字稿</button>
-    <button id="btn-drafts" type="button">審核草稿 <span id="draft-count">0</span></button>
-    <label class="btn">匯入 CSV<input id="file-import" type="file" accept=".csv,text/csv" hidden></label>
-    <a id="btn-export" class="btn" href="/api/export.csv">匯出 CSV</a>
+    <button id="btn-new" class="primary" type="button">＋ 新增事項</button>
     <details class="more" id="more-menu">
-      <summary>更多 ▾</summary>
+      <summary>資料與工具</summary>
       <div class="more-panel">
+        <button id="btn-csv-import" type="button">匯入 CSV</button>
+        <input id="file-import" type="file" accept=".csv,text/csv" hidden>
+        <a id="btn-export" class="btn" href="/api/export.csv">匯出 CSV</a>
+        <a class="btn" href="/api/history.csv">匯出變更紀錄</a>
+        <hr>
         <button id="btn-project" type="button">專案名稱</button>
         <button id="btn-agenda" type="button">議程草稿</button>
-        <a class="btn" href="/api/history.csv">匯出變更紀錄</a>
         <button id="btn-backup" type="button">備份</button>
+        <hr>
         <button id="btn-sample-load" type="button">載入範例</button>
         <button id="btn-sample-clear" class="danger" type="button">清除範例</button>
         <button id="btn-wipe" class="danger" type="button">清空全部資料</button>
-        <button type="button" class="layout-more" data-layout="board">看板</button>
-        <button type="button" class="layout-more" data-layout="split">清單</button>
-        <button type="button" class="layout-more" data-layout="segment">分段</button>
-        <details class="advanced">
-          <summary>排序與其他篩選</summary>
-          <label>類型<select id="f-issue_type"><option value="">全部類型</option></select></label>
-          <label>負責人<input id="f-owner" type="text" placeholder="負責人" aria-label="負責人"></label>
-          <label>排序<select id="f-sort" aria-label="排序">
-            <option value="due_date">依期限</option>
-            <option value="priority">依優先級</option>
-            <option value="updated_at">依更新時間</option>
-            <option value="issue_id">依編號</option>
-            <option value="status">依狀態</option>
-            <option value="owner">依負責人</option>
-          </select></label>
-          <label>順序<select id="f-order" aria-label="順序"><option value="asc">升冪</option><option value="desc">降冪</option></select></label>
-        </details>
       </div>
     </details>
-    <button id="btn-theme" class="theme-toggle" type="button" aria-pressed="true">☀ 切換為淺粉</button>
+    <button id="btn-theme" class="theme-toggle" type="button" aria-pressed="true">切換亮版</button>
   </div>
 </header>
 
@@ -58,10 +45,13 @@
   <aside class="sidebar" id="sidebar">
     <button id="btn-sidebar" class="sidebar-toggle" type="button" aria-expanded="true" aria-controls="side-body">收合篩選</button>
     <div id="side-body">
-      <div id="search-slot-side">
-        <input id="f-q" type="search" placeholder="搜尋編號、標題、圖號、模型…" aria-label="搜尋編號、標題、描述、來源、圖號或模型">
-      </div>
       <nav id="side-filters" class="side-filters" aria-label="篩選"></nav>
+      <div class="sidebar-fields">
+        <label for="f-owner">負責人</label>
+        <input id="f-owner" type="text" placeholder="輸入負責人姓名">
+        <label for="f-issue_type">事項類型</label>
+        <select id="f-issue_type"><option value="">全部類型</option></select>
+      </div>
       <select id="f-project" hidden aria-hidden="true"><option value="">全部專案</option></select>
       <select id="f-status" hidden aria-hidden="true"><option value="">全部狀態</option></select>
       <select id="f-priority" hidden aria-hidden="true"><option value="">全部優先級</option></select>
@@ -75,15 +65,45 @@
   </aside>
   <div class="stage">
     <div class="stage-bar">
-      <div class="layout-switch" role="tablist" aria-label="畫面">
-        <button id="layout-board" type="button" role="tab" data-layout="board" aria-selected="true" aria-controls="view-board">看板</button>
-        <button id="layout-split" type="button" role="tab" data-layout="split" aria-selected="false" aria-controls="view-split">清單</button>
-        <button id="layout-segment" type="button" role="tab" data-layout="segment" aria-selected="false" aria-controls="view-segment">分段</button>
+      <div id="search-slot-top">
+        <input id="f-q" type="search" placeholder="搜尋編號、標題、圖號、模型…" aria-label="搜尋編號、標題、描述、來源、圖號或模型">
       </div>
-      <div id="view-segments" class="view-segments" role="group" aria-label="檢視" hidden></div>
-      <div id="search-slot-top"></div>
+      <div class="sort-controls">
+        <label for="f-sort">排序</label>
+        <select id="f-sort">
+          <option value="due_date">依期限</option>
+          <option value="priority">依優先級</option>
+          <option value="updated_at">依更新時間</option>
+          <option value="issue_id">依編號</option>
+          <option value="status">依狀態</option>
+          <option value="owner">依負責人</option>
+        </select>
+        <select id="f-order" aria-label="排序順序"><option value="asc">升冪</option><option value="desc">降冪</option></select>
+      </div>
+      <div class="layout-switch" role="group" aria-label="畫面">
+        <button id="layout-board" type="button" data-layout="board" aria-pressed="true" aria-controls="view-board">看板</button>
+        <button id="layout-split" type="button" data-layout="split" aria-pressed="false" aria-controls="view-split">清單</button>
+        <button id="layout-segment" type="button" data-layout="segment" aria-pressed="false" aria-controls="view-segment">橫向分欄</button>
+      </div>
     </div>
-    <p id="empty" class="empty" hidden>沒有符合條件的事項</p>
+    <p id="result-summary" class="result-summary" role="status" hidden></p>
+    <div id="active-filters" class="active-filters" role="group" aria-label="已套用的篩選" hidden>
+      <span class="filter-label">已套用</span>
+      <div id="filter-chips" class="filter-chips"></div>
+      <button id="btn-clear-filters" type="button">清除篩選</button>
+    </div>
+    <div class="segment-bar" id="segment-bar" hidden>
+      <div id="view-segments" class="view-segments" role="group" aria-label="檢視" hidden></div>
+    </div>
+    <section id="empty" class="empty" aria-labelledby="empty-title" hidden>
+      <h2 id="empty-title">尚無事項</h2>
+      <p id="empty-description">匯入會議逐字稿，或手動新增第一筆事項，開始追蹤決議與證據。</p>
+      <div class="empty-actions">
+        <button id="btn-empty-import" class="primary" type="button">匯入逐字稿</button>
+        <button id="btn-empty-new" type="button">新增事項</button>
+        <button id="btn-empty-clear" type="button" hidden>清除篩選</button>
+      </div>
+    </section>
     <div id="view-board" class="board"></div>
     <div id="view-split" class="split" hidden>
       <div id="split-list" class="split-list"></div>
@@ -181,6 +201,32 @@
     <button type="button" id="btn-import-close">關閉</button>
     <button type="button" id="btn-import-preview">預覽</button>
     <button type="button" id="btn-import-confirm" class="primary">確認匯入</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-transcripts" aria-labelledby="transcripts-title">
+  <h2 id="transcripts-title">已匯入逐字稿</h2>
+  <p class="hint">按專案管理本機已匯入的逐字稿。刪除前會列出受影響數量，不會刪除磁碟上的原始檔。</p>
+  <div class="filters transcript-toolbar">
+    <label for="transcript-project">專案</label>
+    <select id="transcript-project"></select>
+    <button id="btn-transcripts-reload" type="button">重新整理</button>
+  </div>
+  <div id="transcript-errors" class="msg error" role="alert" hidden></div>
+  <div id="transcript-feedback" class="msg" role="status" hidden></div>
+  <div id="transcript-list" class="stack scroll" aria-live="polite"></div>
+  <div class="dlg-actions"><button id="btn-transcripts-close" type="button">關閉</button></div>
+</dialog>
+
+<dialog id="dlg-transcript-delete" aria-labelledby="transcript-delete-title" aria-describedby="transcript-delete-note">
+  <h2 id="transcript-delete-title">確認刪除逐字稿</h2>
+  <p id="transcript-delete-file" class="transcript-filename"></p>
+  <p id="transcript-delete-impact"></p>
+  <p id="transcript-delete-note">將刪除本機資料庫中的逐字稿、段落與草稿紀錄。已入帳事項會保留並解除逐字稿來源關聯，已保存的檔名、位置、摘錄與文件關聯也會保留，但無法再回查此逐字稿原文。不會刪除磁碟上的原始檔。刪除前會自動備份資料庫。</p>
+  <div id="transcript-delete-errors" class="msg error" role="alert" hidden></div>
+  <div class="dlg-actions">
+    <button id="btn-transcript-delete-cancel" type="button" autofocus>取消</button>
+    <button id="btn-transcript-delete-confirm" class="danger" type="button">確認刪除逐字稿</button>
   </div>
 </dialog>
 

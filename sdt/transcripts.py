@@ -10,6 +10,7 @@ import json
 import math
 import pathlib
 import re
+import sqlite3
 
 from . import db
 
@@ -1119,6 +1120,78 @@ def get_transcript(conn, transcript_id):
     return dict(row)
 
 
+def _linked_issues(conn: sqlite3.Connection, transcript_id: str) -> list[dict]:
+    rows = conn.execute(
+        """SELECT * FROM issues WHERE transcript_id=?
+           OR draft_id IN (SELECT draft_id FROM drafts WHERE transcript_id=?)
+           OR segment_ref IN (SELECT segment_id FROM transcript_segments WHERE transcript_id=?)
+           ORDER BY issue_id""", (transcript_id, transcript_id, transcript_id))
+    return [dict(row) for row in rows]
+
+
+def deletion_preview(conn: sqlite3.Connection, transcript_id: str) -> dict:
+    """Return counts and a snapshot token without exposing transcript text."""
+    transcript = get_transcript(conn, transcript_id)
+    drafts = [dict(row) for row in conn.execute(
+        "SELECT * FROM drafts WHERE transcript_id=? ORDER BY draft_id", (transcript_id,))]
+    issues = _linked_issues(conn, transcript_id)
+    snapshot = json.dumps([transcript, drafts, issues], sort_keys=True, ensure_ascii=False)
+    return {
+        "transcript_id": transcript_id, "project_id": transcript["project_id"],
+        "filename": transcript["filename"], "draft_count": len(drafts),
+        "pending_draft_count": sum(d["review_status"] == "草稿" for d in drafts),
+        "confirmed_draft_count": sum(d["review_status"] == "已確認" for d in drafts),
+        "discarded_draft_count": sum(d["review_status"] == "已捨棄" for d in drafts),
+        "issue_count": len(issues),
+        "issue_ids": [issue["issue_id"] for issue in issues],
+        "message": _delete_message(len(issues), len(drafts), sum(d["review_status"] == "已確認" for d in drafts)),
+        "preview_token": hashlib.sha256(snapshot.encode("utf-8")).hexdigest(),
+    }
+
+
+def _delete_message(issue_count: int, draft_count: int, confirmed_count: int) -> str:
+    if issue_count or confirmed_count:
+        return (f"此逐字稿有 {issue_count} 筆已入帳事項、{confirmed_count} 筆已確認草稿。"
+                "請選擇「保留台帳並解除來源」；事項會保留，只解除逐字稿來源連結。")
+    return f"將刪除逐字稿段落與 {draft_count} 筆未入帳草稿。台帳沒有來自這份逐字稿的事項。"
+
+
+def delete_transcript(conn: sqlite3.Connection, transcript_id: str, *,
+                      preview_token: str, operator: str, ledger: str = "") -> dict:
+    """Remove imported data atomically after a matching preview.
+
+    Linked ledger items need an explicit choice: ledger="detach" keeps them and clears
+    their transcript links; ledger="block" cancels. Copied evidence and the original TXT stay.
+    """
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    impact = deletion_preview(conn, transcript_id)
+    if not preview_token or preview_token != impact["preview_token"]:
+        raise db.ValidationError(["受影響資料已改變，請取消後重新按刪除，核對最新數量再確認。"])
+    if impact["issue_count"] or impact["confirmed_draft_count"]:
+        if ledger == "block":
+            return dict(impact, deleted=False, message="已取消，台帳與逐字稿都沒有刪。")
+        if ledger != "detach":
+            raise NeedsChoice(dict(impact, deleted=False))
+    when = db.now_str()
+    for issue in _linked_issues(conn, transcript_id):
+        for field in ("transcript_id", "segment_ref", "draft_id"):
+            if issue[field]:
+                db._log(conn, issue["issue_id"], when, operator, "delete-transcript", field, issue[field], "")
+        conn.execute(
+            "UPDATE issues SET transcript_id='', segment_ref='', draft_id='', updated_at=? WHERE issue_id=?",
+            (when, issue["issue_id"]))
+    conn.execute("DELETE FROM drafts WHERE transcript_id=?", (transcript_id,))
+    conn.execute("DELETE FROM transcript_segments WHERE transcript_id=?", (transcript_id,))
+    conn.execute("DELETE FROM extraction_runs WHERE transcript_id=?", (transcript_id,))
+    conn.execute("DELETE FROM transcripts WHERE transcript_id=?", (transcript_id,))
+    return {"deleted": True, "drafts_deleted": impact["draft_count"],
+            "issues_preserved": impact["issue_count"], "transcript_id": transcript_id,
+            "message": (f"已刪除逐字稿 {transcript_id}。"
+                        + ("已入帳事項保留並解除來源關聯。" if impact["issue_count"] else "沒有刪除台帳事項。")
+                        + "沒有刪磁碟上的原始 TXT。")}
+
+
 def list_segments(conn, transcript_id):
     get_transcript(conn, transcript_id)
     rows = conn.execute(
@@ -1972,90 +2045,6 @@ class NeedsChoice(Exception):
     def __init__(self, plan):
         super().__init__(plan.get("message") or "需要選擇")
         self.plan = plan
-
-
-def _transcript_delete_plan(conn, transcript_id):
-    item = get_transcript(conn, transcript_id)
-    drafts = conn.execute(
-        "SELECT draft_id, review_status, issue_id FROM drafts WHERE transcript_id=?",
-        (transcript_id,)).fetchall()
-    issues = conn.execute(
-        """SELECT issue_id FROM issues
-           WHERE transcript_id=?
-              OR draft_id IN (SELECT draft_id FROM drafts WHERE transcript_id=?)
-           ORDER BY issue_id""",
-        (transcript_id, transcript_id)).fetchall()
-    statuses = [row["review_status"] for row in drafts]
-    issue_ids = [row["issue_id"] for row in issues]
-    confirmed = sum(1 for status in statuses if status == "已確認")
-    unconfirmed = sum(1 for status in statuses if status == "草稿")
-    discarded = sum(1 for status in statuses if status == "已捨棄")
-    segment_count = conn.execute(
-        "SELECT COUNT(*) FROM transcript_segments WHERE transcript_id=?",
-        (transcript_id,)).fetchone()[0]
-    if issue_ids or confirmed:
-        listed = "、".join(issue_ids) if issue_ids else "（找不到對應事項）"
-        message = (
-            f"此逐字稿有 {len(issue_ids)} 筆已入帳事項（{listed}）、"
-            f"{confirmed} 筆已確認草稿。不會刪除這些事項。"
-            "若要刪除逐字稿，請明確選擇保留台帳並解除來源。"
-        )
-    else:
-        message = (
-            f"將刪除 {segment_count} 段與 {unconfirmed + discarded} 筆未入帳草稿。"
-            "台帳沒有來自這份逐字稿的事項。不會刪磁碟上的原始 TXT。"
-        )
-    return {
-        "transcript_id": transcript_id,
-        "filename": item["filename"],
-        "segment_count": segment_count,
-        "draft_count": len(drafts),
-        "unconfirmed_count": unconfirmed,
-        "discarded_count": discarded,
-        "confirmed_count": confirmed,
-        "issue_ids": issue_ids,
-        "deleted": False,
-        "message": message,
-    }
-
-
-def delete_transcript_preview(conn, transcript_id):
-    return _transcript_delete_plan(conn, transcript_id)
-
-
-def delete_transcript(conn, transcript_id, operator, *, ledger="", now=None):
-    """刪除一份已匯入的逐字稿、段落，以及未入帳草稿。
-
-    已入帳事項預設不刪。ledger 為 detach 時保留事項並清掉來源連結；
-    ledger 為 block 或未指定時，有已入帳事項就整筆不刪。不讀、不刪磁碟上的原始 TXT。
-    """
-    plan = _transcript_delete_plan(conn, transcript_id)
-    if plan["issue_ids"] or plan["confirmed_count"]:
-        if ledger == "block":
-            return dict(plan, deleted=False, message="已取消，台帳與逐字稿都沒有刪。")
-        if ledger != "detach":
-            raise NeedsChoice(plan)
-    when = now or db.now_str()
-    if ledger == "detach":
-        for issue_id in plan["issue_ids"]:
-            issue = db.get_issue(conn, issue_id)
-            for field in ("transcript_id", "segment_ref", "draft_id"):
-                old = issue.get(field) or ""
-                if not old:
-                    continue
-                conn.execute(f"UPDATE issues SET {field}=? WHERE issue_id=?", ("", issue_id))
-                db._log(conn, issue_id, when, operator, "detach-transcript", field, old, "")
-            conn.execute("UPDATE issues SET updated_at=? WHERE issue_id=?", (when, issue_id))
-    conn.execute("DELETE FROM drafts WHERE transcript_id=?", (transcript_id,))
-    conn.execute("DELETE FROM transcript_segments WHERE transcript_id=?", (transcript_id,))
-    conn.execute("DELETE FROM extraction_runs WHERE transcript_id=?", (transcript_id,))
-    conn.execute("DELETE FROM transcripts WHERE transcript_id=?", (transcript_id,))
-    kept = "已保留台帳並解除來源。" if ledger == "detach" and plan["issue_ids"] else "沒有刪除台帳事項。"
-    return dict(
-        plan,
-        deleted=True,
-        message=f"已刪除逐字稿 {transcript_id}。{kept}沒有刪磁碟上的原始 TXT。",
-    )
 
 
 def delete_draft(conn, draft_id):
