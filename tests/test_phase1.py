@@ -174,6 +174,9 @@ class TestDraftsAndLedger(Base):
         self.assertEqual(issue["source_excerpt"], draft["source_quote"])
         self.assertEqual(issue["source_quote"], draft["source_quote"])
         self.assertEqual(issue["source_file"], "meeting.json")
+        self.assertEqual(issue["source_status"], "無法驗證")
+        self.assertEqual(issue["source_checked"], "未核對")
+        self.assertEqual(issue["audio_checked"], "未核對")
         self.assertIn("段落 1", issue["source_location"])
         self.assertIn("00:00:00.000", issue["source_location"])
         self.assertEqual(issue["project_id"], proj["project_id"])
@@ -455,7 +458,15 @@ class TestMigration(Base):
         legacy.commit()
         legacy.close()
         self.conn = db.connect(self.db_path)
+        migration_backups = list((self.dir / "backups").glob("t.pre-schema-migration-*.db"))
+        self.assertEqual(len(migration_backups), 1)
+        before = sqlite3.connect(migration_backups[0])
+        try:
+            backup_title = before.execute("SELECT title FROM issues WHERE issue_id='SDT-0007'").fetchone()[0]
+        finally:
+            before.close()
         kept = db.get_issue(self.conn, "SDT-0007")
+        self.assertEqual(backup_title, kept["title"])
         other = db.get_issue(self.conn, "SDT-0008")
         self.assertEqual(kept["title"], "遷移前事項")
         self.assertEqual(kept["project"], "舊專案")

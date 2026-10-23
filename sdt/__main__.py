@@ -19,11 +19,13 @@ def _server_running(port):
 
 def cmd_serve(cfg, args):
     port = args.port or cfg.port
+    url = f"http://127.0.0.1:{port}/"
     if _server_running(port):
-        print(f"已有服務在執行：http://127.0.0.1:{port}/")
+        print(f"已有服務在執行：{url}")
+        if not args.no_browser:
+            webbrowser.open(url)
         return 0
     srv = server.make_server(cfg, port)
-    url = f"http://127.0.0.1:{port}/"
     print(f"SCADA 決議追蹤器已啟動：{url}")
     print("停止方式：在此視窗按 Ctrl+C，或執行 stop.bat")
     if not args.no_browser:

@@ -575,6 +575,13 @@ dialog h3 { margin: 16px 0 0; font-size: 15px; }
 .transcript-filename { font-weight: 600; overflow-wrap: anywhere; }
 .transcript-entry button { flex: none; min-height: 36px; }
 #dlg-transcript-delete { max-width: 640px; }
+#dlg-meeting-results { width: min(1100px, calc(100vw - 32px)); }
+.meeting-diagnostics { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0 18px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+.meeting-diagnostics p { margin: 4px 0; color: var(--muted); font-variant-numeric: tabular-nums; }
+#meeting-results-list .card { background: var(--panel); }
+#meeting-results-list textarea { width: 100%; min-height: 4.5em; resize: vertical; }
+#meeting-results-list details { margin-top: 8px; }
+#meeting-results-list summary { color: var(--accent); cursor: pointer; }
 #transcript-delete-impact, #transcript-delete-note { line-height: 1.7; }
 #transcript-delete-note { color: var(--muted); }
 #transcript-feedback { overflow-wrap: anywhere; }

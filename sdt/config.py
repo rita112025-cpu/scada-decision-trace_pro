@@ -11,6 +11,8 @@ DEFAULTS = {
     "data_dir": "data",
     "local_notebook_url": "",
     "local_notebook_db": "",
+    "local_llm_url": "http://127.0.0.1:11434",
+    "local_llm_model": "qwen3:latest",
 }
 
 
@@ -21,6 +23,8 @@ class Config:
     data_dir: pathlib.Path
     local_notebook_url: str = ""
     local_notebook_db: str = ""
+    local_llm_url: str = "http://127.0.0.1:11434"
+    local_llm_model: str = "qwen3:latest"
 
     @property
     def db_path(self):
@@ -49,4 +53,6 @@ def load(path=None):
     return Config(operator=str(values["operator"]).strip() or DEFAULTS["operator"],
                   port=int(values["port"]), data_dir=data_dir,
                   local_notebook_url=str(values.get("local_notebook_url") or "").strip(),
-                  local_notebook_db=notebook_db)
+                  local_notebook_db=notebook_db,
+                  local_llm_url=str(values.get("local_llm_url") or DEFAULTS["local_llm_url"]).strip(),
+                  local_llm_model=str(values.get("local_llm_model") or "").strip())

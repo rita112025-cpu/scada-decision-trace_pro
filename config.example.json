@@ -3,5 +3,7 @@
   "port": 8765,
   "data_dir": "data",
   "local_notebook_url": "http://127.0.0.1:8766",
-  "local_notebook_db": ""
+  "local_notebook_db": "",
+  "local_llm_url": "http://127.0.0.1:11434",
+  "local_llm_model": "qwen3:latest"
 }
