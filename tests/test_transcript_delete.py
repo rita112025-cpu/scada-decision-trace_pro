@@ -59,7 +59,7 @@ class TestTranscriptDeletion(unittest.TestCase):
 
     def delete(self, transcript_id, preview):
         return self.req("DELETE", f"/api/transcripts/{transcript_id}",
-                        {"confirm": True, "preview_token": preview["preview_token"]})
+                        {"confirm": True, "preview_token": preview["preview_token"], "ledger": "detach"})
 
     def test_delete_preserves_issues_evidence_links_other_projects_and_original(self):
         imported = self.import_file()
@@ -164,7 +164,8 @@ class TestTranscriptDeletion(unittest.TestCase):
             conn.execute("CREATE TRIGGER fail_delete BEFORE DELETE ON transcripts BEGIN SELECT RAISE(ABORT, 'test failure'); END")
         with self.assertRaises(sqlite3.IntegrityError):
             with db.session(self.cfg.db_path) as conn:
-                transcripts.delete_transcript(conn, tid, preview_token=self.preview(tid)["preview_token"], operator="測試員")
+                transcripts.delete_transcript(conn, tid, preview_token=self.preview(tid)["preview_token"], operator="測試員",
+                                              ledger="detach")
         _, issue = self.req("GET", f"/api/issues/{confirmed['issue']['issue_id']}")
         self.assertEqual(issue["transcript_id"], tid)
         self.assertEqual(self.preview(tid)["draft_count"], 3)

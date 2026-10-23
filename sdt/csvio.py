@@ -1,6 +1,8 @@
 """CSV 匯入／匯出。匯出用 UTF-8 BOM，讓中文 Windows Excel 直接開啟不亂碼。"""
 import csv
+import datetime as dt
 import io
+import re
 
 from . import db
 
@@ -59,24 +61,59 @@ def decode(data):
 
 def parse(data):
     text, _ = decode(data)
-    reader = csv.reader(io.StringIO(text, newline=""))
+    reader = csv.reader(io.StringIO(text, newline=""), strict=True)
     try:
         header = next(reader)
     except StopIteration:
         raise db.ValidationError(["CSV 是空的"])
+    except csv.Error:
+        raise db.ValidationError(["CSV 標題列格式錯誤，請檢查引號與欄位"])
     keys = [_HEADER_TO_KEY.get(h.strip()) for h in header]
     unknown = [h for h, k in zip(header, keys) if k is None and h.strip()]
     if unknown:
         raise db.ValidationError([f"無法辨識的欄位：{'、'.join(unknown)}"])
     if "title" not in keys:
         raise db.ValidationError(["缺少「標題」欄位"])
+    present = [k for k in keys if k]
+    if len(present) != len(set(present)):
+        raise db.ValidationError(["CSV 欄位重複，中文與英文同名欄位只能保留一個"])
     rows = []
-    for line_no, raw in enumerate(reader, start=2):
-        if not any(cell.strip() for cell in raw):
-            continue
-        row = {k: _unescape(v) for k, v in zip(keys, raw) if k}
-        rows.append((line_no, row))
+    try:
+        for line_no, raw in enumerate(reader, start=2):
+            if not any(cell.strip() for cell in raw):
+                continue
+            if len(raw) != len(keys):
+                raise db.ValidationError([f"第 {line_no} 列：欄位數與標題列不符（應為 {len(keys)} 欄，實際 {len(raw)} 欄）"])
+            row = {k: _unescape(v) for k, v in zip(keys, raw) if k}
+            rows.append((line_no, row))
+    except csv.Error:
+        raise db.ValidationError([f"CSV 格式錯誤（第 {reader.line_num} 行附近），請檢查引號與欄位"])
     return rows
+
+
+_CREATED_AT = re.compile(
+    r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$"
+)
+
+
+def _normalize_created_at(value):
+    """空的用現在時間。寫進台帳前先擋下不是日期的值。"""
+    text = (value or "").strip()
+    if not text:
+        return None
+    matched = _CREATED_AT.match(text)
+    if not matched:
+        raise db.ValidationError([f"建立時間「{text}」格式錯誤，請用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS"])
+    try:
+        day = dt.date(int(matched[1]), int(matched[2]), int(matched[3]))
+    except ValueError:
+        raise db.ValidationError([f"建立時間「{text}」不是有效日期，請用 YYYY-MM-DD 或 YYYY-MM-DD HH:MM:SS"])
+    if matched[4] is None:
+        return f"{day.isoformat()} 00:00:00"
+    hour, minute, second = int(matched[4]), int(matched[5]), int(matched[6] or 0)
+    if hour > 23 or minute > 59 or second > 59:
+        raise db.ValidationError([f"建立時間「{text}」不是有效時間，請用 YYYY-MM-DD HH:MM:SS"])
+    return f"{day.isoformat()} {hour:02d}:{minute:02d}:{second:02d}"
 
 
 def import_issues(conn, data, operator, now=None):
@@ -94,6 +131,7 @@ def import_issues(conn, data, operator, now=None):
                     continue
                 seen.add(issue_id)
             try:
+                created_at = _normalize_created_at(row.get("created_at"))
                 exists = issue_id and conn.execute(
                     "SELECT 1 FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
                 if exists:
@@ -101,7 +139,6 @@ def import_issues(conn, data, operator, now=None):
                     _, w, diff = db.update_issue(conn, issue_id, changes, operator, now=now, action="import")
                     updated += bool(diff)
                 else:
-                    created_at = (row.get("created_at") or "").strip() or None
                     _, w = db.create_issue(conn, row, operator, now=now, action="import",
                                            issue_id=issue_id or None, created_at=created_at)
                     created += 1
@@ -117,3 +154,4 @@ def import_issues(conn, data, operator, now=None):
     conn.execute("RELEASE import_csv")
     return {"created": created, "updated": updated, "unchanged": len(rows) - created - updated,
             "warnings": warnings}
+

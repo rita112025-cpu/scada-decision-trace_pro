@@ -129,6 +129,26 @@ def cmd_agenda(cfg, args):
     return 0
 
 
+def cmd_check_ids(cfg, args):
+    # 唯讀連線：不建檔、不遷移、不寫入，舊版資料庫也維持原樣
+    try:
+        conn = db.connect_readonly(cfg.db_path)
+    except FileNotFoundError:
+        print(f"錯誤：找不到資料庫 {cfg.db_path}")
+        return 1
+    try:
+        ids = db.reused_issue_ids(conn)
+    finally:
+        conn.close()
+    if not ids:
+        print("變更紀錄中沒有發現「刪除後又建立」的重複編號")
+        return 0
+    print("以下編號在變更紀錄中，刪除之後又出現建立紀錄，歷史可能混有不同事項，需人工核對（系統不會自動拆分）：")
+    for i in ids:
+        print(f"  {i}")
+    return 0
+
+
 def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -152,10 +172,15 @@ def main(argv=None):
     s.add_argument("file")
     s = sub.add_parser("import", help="匯入 CSV")
     s.add_argument("file")
+    sub.add_parser("check-ids", help="列出變更紀錄中疑似重用的事項編號（唯讀）")
     s = sub.add_parser("agenda", help="產生議程草稿 Markdown")
     s.add_argument("--out")
     args = p.parse_args(argv)
-    cfg = config.load(args.config)
+    try:
+        cfg = config.load(args.config)
+    except config.ConfigError as exc:
+        print(f"錯誤：{exc}")
+        return 1
     try:
         return _run(cfg, args)
     except ValueError as e:
@@ -166,7 +191,8 @@ def main(argv=None):
 def _run(cfg, args):
     handlers ={"serve": cmd_serve, "stop": cmd_stop, "backup": cmd_backup, "restore": cmd_restore,
                 "load-sample": cmd_load_sample, "clear-sample": cmd_clear_sample,
-                "export": cmd_export, "import": cmd_import, "agenda": cmd_agenda}
+                "export": cmd_export, "import": cmd_import, "agenda": cmd_agenda,
+                "check-ids": cmd_check_ids}
     return handlers[args.cmd](cfg, args)
 
 

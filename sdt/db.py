@@ -78,6 +78,13 @@ TRACE_COLUMNS = (
 )
 
 EXTRA_SCHEMA = """
+CREATE TABLE IF NOT EXISTS id_counters (
+    name TEXT PRIMARY KEY,
+    last_value INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS retired_issue_ids (
+    issue_id TEXT PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS projects (
     project_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -151,8 +158,25 @@ CREATE TABLE IF NOT EXISTS drafts (
     issue_id TEXT NOT NULL DEFAULT '',
     evidence_json TEXT NOT NULL DEFAULT '[]',
     outcome_json TEXT NOT NULL DEFAULT '{}',
+    rule_id TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    review_gaps TEXT NOT NULL DEFAULT '',
+    context_refs TEXT NOT NULL DEFAULT '',
+    sentence_index TEXT NOT NULL DEFAULT '',
+    cue TEXT NOT NULL DEFAULT '',
+    confidence TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS extraction_runs (
+    run_id TEXT PRIMARY KEY,
+    transcript_id TEXT NOT NULL,
+    extraction_method TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    added_count INTEGER NOT NULL,
+    skipped_count INTEGER NOT NULL,
+    detail TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS document_links (
@@ -230,6 +254,10 @@ def migrate(conn):
     link_cols = _table_columns(conn, "document_links")
     if "file_hash" not in link_cols:
         conn.execute("ALTER TABLE document_links ADD COLUMN file_hash TEXT NOT NULL DEFAULT ''")
+    draft_cols = _table_columns(conn, "drafts")
+    for col in ("rule_id", "reason", "review_gaps", "context_refs", "sentence_index", "cue", "confidence"):
+        if col not in draft_cols:
+            conn.execute(f"ALTER TABLE drafts ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_issues_project ON issues(project_id)")
     # 依既有「專案」文字歸入穩定 ID。名稱相同的列共用一個專案；空白名稱也保留為一筆。
     names = [r["project"] for r in conn.execute("SELECT DISTINCT project FROM issues")]
@@ -238,27 +266,37 @@ def migrate(conn):
         conn.execute(
             "UPDATE issues SET project_id=? WHERE project=? AND (project_id IS NULL OR project_id='')",
             (pid, name))
+    seed_issue_counter(conn)
+
+
+# 結構有變就加 1。已是這個版本的資料庫不再每次連線都跑建表與遷移。
+SCHEMA_VERSION = 3
 
 
 def connect(path):
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=5.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
-    if _needs_schema_backup(conn):
-        backup_dir = path.parent / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        backup_path = backup_dir / f"{path.stem}.pre-schema-migration-{stamp}.db"
-        backup_conn = sqlite3.connect(backup_path)
-        try:
-            conn.backup(backup_conn)
-        finally:
-            backup_conn.close()
-    conn.executescript(SCHEMA)
-    migrate(conn)
-    conn.commit()
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA journal_mode=WAL").fetchone()
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version < SCHEMA_VERSION:
+        if _needs_schema_backup(conn):
+            backup_dir = path.parent / "backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            backup_path = backup_dir / f"{path.stem}.pre-schema-migration-{stamp}.db"
+            backup_conn = sqlite3.connect(backup_path)
+            try:
+                conn.backup(backup_conn)
+            finally:
+                backup_conn.close()
+        conn.executescript(SCHEMA)
+        migrate(conn)
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.commit()
     return conn
 
 
@@ -379,23 +417,123 @@ def get_issue(conn, issue_id):
     return _row_to_dict(row)
 
 
+ISSUE_PREFIX = "SDT-"
+_ISSUE_ID_RE = re.compile(r"SDT-(\d+)")
+_REMOVE_ACTIONS = ("delete", "clear-sample")
+_CREATE_ACTIONS = ("create", "import", "sample", "confirm-draft")
+
+
+# 計數器存在 SQLite INTEGER（有號 64 位元）。舊版 CSV 可匯入任意長度的數字編號，
+# 超過此上限的編號不納入計數器；是否已用過仍由 issues／issue_history 逐筆比對。
+# 前導零不影響數值（SDT-007 與 SDT-0007 都算 7）。
+_ISSUE_NUMBER_MAX = 2 ** 62
+
+
+_ISSUE_NUMBER_MAX_DIGITS = len(str(_ISSUE_NUMBER_MAX))
+
+
+def _issue_number(issue_id):
+    m = _ISSUE_ID_RE.fullmatch(issue_id or "")
+    if not m:
+        return 0
+    # 先去掉前導零、用位數判斷上限，再轉整數：超長字串直接 int() 會撞到 Python 的位數限制
+    digits = m[1].lstrip("0")
+    if len(digits) > _ISSUE_NUMBER_MAX_DIGITS:
+        return 0
+    n = int(digits or "0")
+    return n if n <= _ISSUE_NUMBER_MAX else 0
+
+
+def _max_used_issue_number(conn):
+    """掃描 issues、issue_history 與清空時留下的已用編號，找出曾經用過的最大 SDT- 編號。"""
+    best = 0
+    for table in ("issues", "issue_history", "retired_issue_ids"):
+        for row in conn.execute(f"SELECT DISTINCT issue_id FROM {table} WHERE issue_id GLOB 'SDT-[0-9]*'"):
+            best = max(best, _issue_number(row[0]))
+    return best
+
+
+def seed_issue_counter(conn):
+    """流水號只增不減。遷移時取計數器、現有事項與變更紀錄三者的最大值，已刪除的編號也算已用過。"""
+    row = conn.execute("SELECT last_value FROM id_counters WHERE name='issue'").fetchone()
+    value = max(row[0] if row else 0, _max_used_issue_number(conn))
+    conn.execute(
+        "INSERT INTO id_counters(name, last_value) VALUES('issue', ?)"
+        " ON CONFLICT(name) DO UPDATE SET last_value=excluded.last_value", (value,))
+
+
+def _issue_id_retired(conn, issue_id):
+    """編號曾經用過但事項已不在：變更紀錄有它，或清空全部資料時登記過。"""
+    return bool(conn.execute("SELECT 1 FROM issue_history WHERE issue_id=? LIMIT 1", (issue_id,)).fetchone()
+                or conn.execute("SELECT 1 FROM retired_issue_ids WHERE issue_id=?", (issue_id,)).fetchone())
+
+
+def _issue_id_used(conn, issue_id):
+    return bool(conn.execute("SELECT 1 FROM issues WHERE issue_id=?", (issue_id,)).fetchone()
+                or _issue_id_retired(conn, issue_id))
+
+
 def _next_issue_id(conn):
-    n = conn.execute("SELECT COUNT(*) FROM issues").fetchone()[0] + 1
-    while conn.execute("SELECT 1 FROM issues WHERE issue_id=?", (f"SDT-{n:04d}",)).fetchone():
+    row = conn.execute("SELECT last_value FROM id_counters WHERE name='issue'").fetchone()
+    n = (row[0] if row else 0) + 1
+    while _issue_id_used(conn, f"{ISSUE_PREFIX}{n:04d}"):
         n += 1
-    return f"SDT-{n:04d}"
+    _set_issue_counter(conn, n)
+    return f"{ISSUE_PREFIX}{n:04d}"
+
+
+def _set_issue_counter(conn, n):
+    conn.execute(
+        "INSERT INTO id_counters(name, last_value) VALUES('issue', ?)"
+        " ON CONFLICT(name) DO UPDATE SET last_value=MAX(last_value, excluded.last_value)", (n,))
+
+
+def connect_readonly(path):
+    """唯讀連線：不建檔、不建表、不遷移。資料庫不存在時丟 FileNotFoundError。"""
+    path = pathlib.Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def reused_issue_ids(conn):
+    """變更紀錄裡，同一編號在刪除之後又出現建立紀錄的編號。這些歷史混有不同事項，需人工核對，不自動拆分。"""
+    removes = ",".join("?" * len(_REMOVE_ACTIONS))
+    creates = ",".join("?" * len(_CREATE_ACTIONS))
+    rows = conn.execute(
+        f"""SELECT DISTINCT c.issue_id FROM issue_history c
+            WHERE c.action IN ({creates}) AND EXISTS (
+                SELECT 1 FROM issue_history r
+                WHERE r.issue_id=c.issue_id AND r.action IN ({removes}) AND r.id < c.id)
+            ORDER BY c.issue_id""", (*_CREATE_ACTIONS, *_REMOVE_ACTIONS))
+    return [r[0] for r in rows]
 
 
 def next_public_id(conn, table, column, prefix):
-    """不可變編號。只掃描指定資料表的既有編號，不重用已發出的 ID。"""
-    best = 0
-    for row in conn.execute(f"SELECT {column} FROM {table}"):
-        val = row[0]
-        if isinstance(val, str) and val.startswith(prefix):
-            tail = val[len(prefix):]
-            if tail.isdigit():
-                best = max(best, int(tail))
-    return f"{prefix}{best + 1:04d}"
+    """不可變編號。用最大編號加一，不重用、不掃整表。格式仍是前綴加至少四位數字。"""
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table or ""):
+        raise db_identifier_error()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column or ""):
+        raise db_identifier_error()
+    if not prefix:
+        raise db_identifier_error()
+    start = len(prefix) + 1
+    row = conn.execute(
+        f"""SELECT MAX(CAST(substr({column}, ?) AS INTEGER))
+            FROM {table}
+            WHERE {column} GLOB ?
+              AND length(substr({column}, ?)) > 0
+              AND substr({column}, ?) NOT GLOB '*[^0-9]*'""",
+        (start, prefix + "[0-9]*", start, start),
+    ).fetchone()
+    best = row[0] or 0
+    return f"{prefix}{int(best) + 1:04d}"
+
+
+def db_identifier_error():
+    return ValidationError(["編號欄位無效"])
 
 
 def list_projects(conn):
@@ -477,6 +615,10 @@ def create_issue(conn, data, operator, *, now=None, action="create", is_sample=F
     issue_id = _clean_text(issue_id or data.get("issue_id")) or _next_issue_id(conn)
     if conn.execute("SELECT 1 FROM issues WHERE issue_id=?", (issue_id,)).fetchone():
         raise ValidationError([f"事項編號 {issue_id} 已存在"])
+    if _issue_id_retired(conn, issue_id):
+        raise ValidationError([f"事項編號 {issue_id} 曾經使用過（已刪除），不能重新建立。請清空編號欄位讓系統配新號"])
+    if _issue_number(issue_id):
+        _set_issue_counter(conn, _issue_number(issue_id))
     cols = ["issue_id", *EDITABLE_FIELDS, "project_id", "created_at", "updated_at", "is_sample"]
     vals = [issue_id, *(clean[k] for k in EDITABLE_FIELDS), pid, created_at or when, when, int(is_sample)]
     conn.execute(f"INSERT INTO issues({','.join(cols)}) VALUES ({','.join('?' * len(cols))})", vals)
@@ -665,3 +807,57 @@ def clear_sample(conn, operator):
         conn.execute(f"DELETE FROM document_links WHERE issue_id IN ({marks})", ids)
     conn.execute("DELETE FROM issues WHERE is_sample=1")
     return len(ids)
+
+
+def delete_issue(conn, issue_id, operator, *, now=None):
+    """刪除一筆台帳事項，並在變更紀錄留下刪除。不刪磁碟上的檔案。
+
+    若事項來自草稿，該草稿回到未入帳，逐字稿本身不刪。文件關聯只刪資料庫裡的連結。
+    """
+    issue = get_issue(conn, issue_id)
+    when = now or now_str()
+    _log(conn, issue_id, when, operator, "delete", "issue_id", issue_id, "")
+    _log(conn, issue_id, when, operator, "delete", "title", issue.get("title") or "", "")
+    link_count = conn.execute(
+        "SELECT COUNT(*) FROM document_links WHERE issue_id=?", (issue_id,)).fetchone()[0]
+    if link_count:
+        _log(conn, issue_id, when, operator, "delete", "document_links", str(link_count), "0")
+        conn.execute("DELETE FROM document_links WHERE issue_id=?", (issue_id,))
+    draft_id = issue.get("draft_id") or ""
+    draft_reverted = False
+    if draft_id:
+        cur = conn.execute(
+            """UPDATE drafts SET review_status='草稿', issue_id='', updated_at=?
+               WHERE draft_id=? AND issue_id=? AND review_status='已確認'""",
+            (when, draft_id, issue_id))
+        draft_reverted = cur.rowcount > 0
+        if draft_reverted:
+            _log(conn, issue_id, when, operator, "delete", "draft_id", draft_id, "")
+    conn.execute("DELETE FROM issues WHERE issue_id=?", (issue_id,))
+    return {
+        "deleted": True,
+        "issue_id": issue_id,
+        "draft_reverted": draft_reverted,
+        "links_removed": link_count,
+        "message": "已刪除事項，變更紀錄保留這次刪除。沒有刪除磁碟上的檔案。"
+        + ("相關草稿已回到未入帳。" if draft_reverted else ""),
+    }
+
+
+def wipe_all(conn):
+    """清空台帳、逐字稿、草稿與專案。呼叫端須先做好備份。不刪備份檔，也不碰磁碟上的原始 TXT。
+
+    編號計數器與已用編號登記不清除，清空後新事項與 CSV 都不會重新用到舊編號。
+    """
+    conn.execute(
+        """INSERT OR IGNORE INTO retired_issue_ids(issue_id)
+           SELECT issue_id FROM issues UNION SELECT issue_id FROM issue_history""")
+    seed_issue_counter(conn)
+    counts = {}
+    for table in (
+        "document_links", "extraction_runs", "drafts", "transcript_segments",
+        "transcripts", "issues", "issue_history", "projects",
+    ):
+        counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        conn.execute(f"DELETE FROM {table}")
+    return counts

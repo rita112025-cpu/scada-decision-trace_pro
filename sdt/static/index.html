@@ -33,6 +33,7 @@
         <hr>
         <button id="btn-sample-load" type="button">載入範例</button>
         <button id="btn-sample-clear" class="danger" type="button">清除範例</button>
+        <button id="btn-wipe" class="danger" type="button">清空全部資料</button>
       </div>
     </details>
     <button id="btn-theme" class="theme-toggle" type="button" aria-pressed="true">切換亮版</button>
@@ -172,6 +173,30 @@
     <label class="wide">檔案<input id="import-file" type="file" accept=".json,.txt,application/json,text/plain"></label>
   </div>
   <pre id="import-preview" class="quote" hidden></pre>
+  <section>
+    <h3>已匯入的逐字稿</h3>
+    <p class="hint">重新解析時間與重新抽取候選是兩個動作，各自預覽、各自套用。都不會自動確認入帳。刪除只拿掉這份匯入與未入帳草稿，不會刪磁碟上的原始 TXT；已入帳事項不會被默默刪掉。</p>
+    <select id="reparse-transcript"></select>
+    <div id="transcript-list" class="stack"></div>
+  </section>
+  <section>
+    <h3>重新解析時間</h3>
+    <p class="hint">只更新對得上的行的時間與抽取用正文。原始行、草稿審核狀態、已入帳事項與原始引用都保留。不會產生新草稿。</p>
+    <div class="filters">
+      <button type="button" id="btn-reparse-preview">預覽重新解析</button>
+      <button type="button" id="btn-reparse-apply">套用重新解析</button>
+    </div>
+    <pre id="reparse-preview" class="quote" hidden></pre>
+  </section>
+  <section>
+    <h3>重新抽取候選</h3>
+    <p class="hint">依 rule:v6 預覽會新增的候選。同一句同時像決議與交辦時，分成決議、待辦兩筆，共用原文；舊版只有決議草稿的句子，會補上一筆待辦。明文標記沿用舊規則；口語說法會標出對上的說法與信心，仍是草稿。「麻煩」要有對象和動作，談預算或「但是麻煩」不收。「你們先／你先」接到確認、看看、改、出圖這類動作會列為草稿；報價、問句、「你們先不用」和「你們先前」不收。套用時只補來源位置還沒有的同類型草稿，不覆寫既有摘要、原文、審核狀態或已入帳事項。相同句子在不同段落會各自保留。舊原文若帶時間前綴，依來源位置對上且不改原句；對不到唯一位置的標成待核對，不新增草稿。</p>
+    <div class="filters">
+      <button type="button" id="btn-reextract-preview">預覽重新抽取</button>
+      <button type="button" id="btn-reextract-apply">套用重新抽取</button>
+    </div>
+    <pre id="reextract-preview" class="quote" hidden></pre>
+  </section>
   <div id="import-errors" class="msg error" hidden></div>
   <div class="dlg-actions">
     <button type="button" id="btn-import-close">關閉</button>
@@ -222,9 +247,19 @@
   </div>
 </dialog>
 
+<dialog id="dlg-source">
+  <h2>從原文補建候選</h2>
+  <p class="hint">規則漏抓時，可以在這裡選一句原文，自己建立決議或待辦草稿。原始引用、段落、時間會自動帶入，摘要請自己填寫。建立後是草稿，不會自動入帳；之後重新抽取不會刪除或覆寫，也不會在同一句再補同類型的規則候選。</p>
+  <p id="source-title" class="hint"></p>
+  <div id="source-list" class="stack scroll"></div>
+  <div class="dlg-actions">
+    <button type="button" id="btn-source-close">關閉</button>
+  </div>
+</dialog>
+
 <dialog id="dlg-drafts">
   <h2>審核草稿</h2>
-  <p class="hint">只有按下「確認入帳」的草稿會進入正式台帳。捨棄或尚未確認的草稿不會出現在事項列表。</p>
+  <p class="hint">只有按下「確認入帳」的草稿會進入正式台帳。捨棄會留下這筆紀錄；刪除則直接拿掉草稿，不留捨棄紀錄，也不會刪台帳。</p>
   <div class="filters">
     <select id="draft-project"></select>
     <select id="draft-status">
@@ -250,6 +285,25 @@
   <div class="dlg-actions">
     <button type="button" id="btn-rename-close">關閉</button>
     <button type="button" id="btn-rename-save" class="primary">儲存名稱</button>
+  </div>
+</dialog>
+
+<dialog id="dlg-delete">
+  <h2 id="delete-title">確認刪除</h2>
+  <pre id="delete-body" class="quote"></pre>
+  <div id="delete-actions" class="dlg-actions"></div>
+</dialog>
+
+<dialog id="dlg-wipe">
+  <h2>清空全部資料</h2>
+  <p class="hint">會先自動備份，再刪除台帳、變更紀錄、逐字稿、草稿與專案。不會刪磁碟上的原始 TXT，也不會刪已經做好的備份檔。</p>
+  <div class="form-grid">
+    <label>請輸入確認詞<input id="wipe-confirm" type="text" autocomplete="off" maxlength="20"></label>
+  </div>
+  <div id="wipe-errors" class="msg error" hidden></div>
+  <div class="dlg-actions">
+    <button type="button" id="btn-wipe-cancel">取消</button>
+    <button type="button" id="btn-wipe-go" class="danger" disabled>清空全部資料</button>
   </div>
 </dialog>
 
