@@ -12,7 +12,7 @@ import pathlib
 import re
 import sqlite3
 
-from . import db
+from . import db, textextract
 
 RULE_V2 = "rule:v2"
 RULE_V3 = "rule:v3"
@@ -100,8 +100,11 @@ def clean_filename(name):
     return base[:200]
 
 
-def decode_upload(content_base64):
-    """把上傳內容還原成位元組並要求是 UTF-8 文字。不嘗試其他編碼，避免誤讀。"""
+def decode_upload(content_base64, filename=""):
+    """把上傳內容還原成位元組並要求是 UTF-8 文字。不嘗試其他編碼，避免誤讀。
+
+    .docx .xlsx .csv .md 先轉成逐行文字，之後和 TXT 走同一條解析。
+    """
     if not isinstance(content_base64, str) or not content_base64.strip():
         raise db.ValidationError(["沒有收到檔案內容"])
     try:
@@ -110,6 +113,9 @@ def decode_upload(content_base64):
         raise db.ValidationError(["檔案內容不是有效的 Base64"])
     if not raw or not raw.strip():
         raise db.ValidationError(["檔案是空的，沒有可匯入的文字"])
+    suffix = textextract.suffix_of(filename)
+    if suffix in textextract.TABULAR_SUFFIXES or suffix in textextract.LEGACY_SUFFIXES:
+        return textextract.extract_text(filename, raw)
     if b"\x00" in raw:
         raise db.ValidationError(["檔案含有二進位內容，請改用 UTF-8 文字或 Transcript_translation 的 JSON"])
     try:
@@ -459,14 +465,14 @@ def parse_upload(filename, text):
     suffix = pathlib.PurePath(name).suffix.lower()
     if suffix == ".json":
         parsed = parse_json(text)
-    elif suffix == ".txt" or suffix == "":
+    elif suffix in (".txt", "") or suffix in textextract.TABULAR_SUFFIXES:
         if suffix == "" and text.lstrip().startswith("{"):
             parsed = parse_json(text)
         else:
             parsed = parse_txt(text)
     else:
         raise db.ValidationError([
-            f"目前只接受 Transcript_translation 的 JSON，以及 UTF-8 TXT，不接受 {suffix}"
+            f"目前接受 Transcript_translation 的 JSON，以及 TXT、DOCX、XLSX、CSV、MD，不接受 {suffix}"
         ])
     parsed["filename"] = name
     return parsed
@@ -474,7 +480,7 @@ def parse_upload(filename, text):
 
 def preview_payload(conn, *, project_id, filename, content_base64):
     project = db.get_project(conn, project_id)
-    text = decode_upload(content_base64)
+    text = decode_upload(content_base64, filename)
     digest, normalized = content_hash(text)
     parsed = parse_upload(filename, normalized)
     existing = conn.execute(
@@ -1041,7 +1047,7 @@ def _insert_draft(conn, *, project_id, transcript_id, segment_id, cand, when):
 
 def import_transcript(conn, *, project_id, filename, content_base64, operator, now=None):
     project = db.get_project(conn, project_id)
-    text = decode_upload(content_base64)
+    text = decode_upload(content_base64, filename)
     digest, normalized = content_hash(text)
     parsed = parse_upload(filename, normalized)
     existing = conn.execute(

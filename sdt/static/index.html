@@ -165,11 +165,11 @@
 
 <dialog id="dlg-import">
   <h2>匯入逐字稿</h2>
-  <p class="hint">接受 Transcript_translation 匯出的 JSON，以及 UTF-8 TXT。匯入前先預覽；相同內容不會重複建立。</p>
+  <p class="hint">接受 Transcript_translation 匯出的 JSON，以及 TXT、Word（.docx）、Excel（.xlsx）、CSV、Markdown 的會議紀錄；Word 與 Excel 的表格每列轉成一行，行首若有時間會照 TXT 規則辨識。匯入前先預覽；相同內容不會重複建立。</p>
   <div class="form-grid">
     <label>專案<select id="import-project"></select></label>
     <label>新專案名稱<input id="import-new-project" type="text" maxlength="200" placeholder="留空則用上方已選專案"></label>
-    <label class="wide">檔案<input id="import-file" type="file" accept=".json,.txt,application/json,text/plain"></label>
+    <label class="wide">檔案<input id="import-file" type="file" accept=".json,.txt,.md,.csv,.docx,.xlsx"></label>
   </div>
   <pre id="import-preview" class="quote" hidden></pre>
   <section>
