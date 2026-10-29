@@ -1511,32 +1511,16 @@ function renderDraft(draft) {
   const due = document.createElement("input");
   due.type = "date";
   due.value = draft.due_date;
-  const kind = document.createElement("select");
-  for (const value of ["\u6c7a\u8b70", "\u660e\u78ba\u6c7a\u8b70", "\u5f85\u8fa6", "\u73fe\u6cc1\u8aaa\u660e", "\u63d0\u8b70", "\u722d\u8b70", "\u5f85\u78ba\u8a8d"]) {
-    const option = document.createElement("option");
-    option.value = value;
-    option.textContent = value;
-    kind.append(option);
-  }
-  kind.value = draft.kind;
-  const action = document.createElement("textarea");
-  action.placeholder = "\u5f85\u8fa6\u52d5\u4f5c\uff08\u539f\u6587\u672a\u660e\u78ba\u63d0\u4f9b\u5247\u7559\u7a7a\uff09";
-  action.value = draft.outcome?.action || "";
-  const deliverable = document.createElement("textarea");
-  deliverable.placeholder = "\u4ea4\u4ed8\u6210\u679c\uff08\u539f\u6587\u672a\u660e\u78ba\u63d0\u4f9b\u5247\u7559\u7a7a\uff09";
-  deliverable.value = draft.outcome?.deliverable || "";
   card.append(el("p", "\u6458\u8981", "hint"), summary);
-  card.append(el("p", "\u7d50\u8ad6\u985e\u578b", "hint"), kind);
-  card.append(el("p", "\u5f85\u8fa6\u52d5\u4f5c\u8207\u4ea4\u4ed8\u6210\u679c", "hint"), action, deliverable);
   card.append(el("p", "\u8ca0\u8cac\u4eba\u8207\u671f\u9650\u53ea\u6709\u539f\u6587\u660e\u78ba\u63d0\u4f9b\u6642\u624d\u586b\u3002", "hint"), owner, due);
   const actions = el("div", "", "row-actions");
   if (draft.review_status === "\u8349\u7a3f") {
     const save = el("button", "\u5132\u5b58\u4fee\u8a02");
     save.type = "button";
-    save.addEventListener("click", () => saveDraft(draft.draft_id, summary.value, owner.value, due.value, kind.value, action.value, deliverable.value).catch((e) => showMsg(e.message, "error")));
+    save.addEventListener("click", () => saveDraft(draft.draft_id, summary.value, owner.value, due.value).catch((e) => showMsg(e.message, "error")));
     const ok = el("button", "\u9078\u64c7\u5165\u5e33", "primary");
     ok.type = "button";
-    ok.addEventListener("click", () => confirmDraft(draft.draft_id, summary.value, owner.value, due.value, kind.value, action.value, deliverable.value).catch((e) => showMsg(e.message, "error")));
+    ok.addEventListener("click", () => confirmDraft(draft.draft_id, summary.value, owner.value, due.value).catch((e) => showMsg(e.message, "error")));
     const drop = el("button", "\u6368\u68c4");
     drop.type = "button";
     drop.addEventListener("click", () => discardDraft(draft.draft_id).catch((e) => showMsg(e.message, "error")));
@@ -1586,14 +1570,14 @@ function draftDetails(draft) {
   return details;
 }
 
-async function saveDraft(id, summary, owner, due, kind, action, deliverable) {
-  await api("/api/drafts/" + encodeURIComponent(id), { method: "PUT", json: { summary, owner, due_date: due, kind, action, deliverable } });
+async function saveDraft(id, summary, owner, due) {
+  await api("/api/drafts/" + encodeURIComponent(id), { method: "PUT", json: { summary, owner, due_date: due } });
   showMsg(`${id} 已儲存修改，尚未入帳。`);
   await reloadDrafts();
 }
 
-async function confirmDraft(id, summary, owner, due, kind, action, deliverable) {
-  await saveDraft(id, summary, owner, due, kind, action, deliverable);
+async function confirmDraft(id, summary, owner, due) {
+  await saveDraft(id, summary, owner, due);
   const res = await api(`/api/drafts/${encodeURIComponent(id)}/confirm`, { method: "POST", json: {} });
   showMsg(res.message);
   await reloadDrafts();
