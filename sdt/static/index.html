@@ -24,7 +24,7 @@
         <button id="btn-csv-import" type="button">匯入 CSV</button>
         <input id="file-import" type="file" accept=".csv,text/csv" hidden>
         <a id="btn-export" class="btn" href="/api/export.csv">匯出 CSV</a>
-        <a class="btn" href="/api/history.csv">匯出變更紀錄</a>
+        <a id="btn-history" class="btn" href="/api/history.csv">匯出變更紀錄</a>
         <hr>
         <button id="btn-project" type="button">專案名稱</button>
         <button id="btn-agenda" type="button">議程草稿</button>
@@ -254,6 +254,7 @@
     <button type="button" id="btn-draft-reload">重新整理</button>
   </div>
   <div id="draft-list" class="stack scroll"></div>
+  <div id="draft-pager" class="filters"></div>
   <div class="dlg-actions"><button type="button" id="btn-draft-close" class="primary">關閉</button></div>
 </dialog>
 

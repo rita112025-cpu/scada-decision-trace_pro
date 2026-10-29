@@ -610,3 +610,5 @@ dialog h3 { margin: 16px 0 0; font-size: 15px; }
 @media (pointer: coarse) {
   .sort-controls select, .layout-switch button, .empty-actions button { min-height: 44px; }
 }
+
+.draft-details > summary { cursor: pointer; font-size: 12px; color: var(--muted); }
