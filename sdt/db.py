@@ -694,6 +694,23 @@ def get_history(conn, issue_id=None):
     return [dict(r) for r in conn.execute(sql + " ORDER BY id", args)]
 
 
+def get_project_history(conn, project_id):
+    """某專案的變更紀錄。
+
+    包含目前在此專案的事項，以及變更紀錄中曾掛在此專案（建立時或改專案時寫下 project_id）
+    的事項，例如已刪除或已移出的事項；這些事項的整段紀錄都列出，依紀錄順序排列。
+    """
+    get_project(conn, project_id)
+    rows = conn.execute(
+        """SELECT * FROM issue_history WHERE issue_id IN (
+               SELECT issue_id FROM issues WHERE project_id=?
+               UNION
+               SELECT issue_id FROM issue_history
+               WHERE field='project_id' AND (new_value=? OR old_value=?))
+           ORDER BY id""", (project_id, project_id, project_id))
+    return [dict(r) for r in rows]
+
+
 def is_overdue(issue, today):
     return bool(issue["due_date"]) and issue["due_date"] < today and issue["status"] not in CLOSED_STATUSES
 

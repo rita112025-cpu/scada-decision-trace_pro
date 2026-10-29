@@ -2,6 +2,7 @@
 import json
 import mimetypes
 import pathlib
+import re
 import threading
 import traceback
 import urllib.parse
@@ -12,6 +13,20 @@ from . import agenda, backup, csvio, db, notebook, sample, transcripts
 STATIC_DIR = pathlib.Path(__file__).resolve().parent / "static"
 CLEAR_SAMPLE_PHRASE = "清除範例資料"
 CLEAR_ALL_PHRASE = "清空"
+MAX_PAGE_SIZE = 500
+
+
+def _page_args(query):
+    """草稿清單分頁參數。沒給 limit 時回傳全部（維持既有呼叫端行為）。"""
+    raw_limit = query.get("limit", "")
+    raw_offset = query.get("offset", "") or "0"
+    if not re.fullmatch(r"[0-9]{1,6}", raw_offset):
+        raise db.ValidationError(["offset 必須是 0 以上的整數"])
+    if raw_limit == "":
+        return None, int(raw_offset)
+    if not re.fullmatch(r"[0-9]{1,6}", raw_limit) or not 1 <= int(raw_limit) <= MAX_PAGE_SIZE:
+        raise db.ValidationError([f"limit 必須是 1 到 {MAX_PAGE_SIZE} 的整數"])
+    return int(raw_limit), int(raw_offset)
 
 
 class App:
@@ -116,7 +131,7 @@ def make_handler(app):
             except db.ValidationError as e:
                 self._json(400, {"errors": e.errors})
             except transcripts.NeedsChoice as e:
-                self._json(409, dict(e.plan, errors=[e.plan["message"]], deleted=False))
+                self._json(409, dict(e.plan, errors=[e.plan["message"]]))
             except notebook.NotebookUnavailable as e:
                 self._json(503, {"errors": e.errors})
             except ValueError as e:  # 備份／還原的已知錯誤，訊息不含路徑
@@ -205,10 +220,13 @@ def make_handler(app):
                 return self._send(200, body, "text/csv; charset=utf-8", {
                     "Content-Disposition": f"attachment; filename=\"issues-{today}{suffix}.csv\""})
             if route == ("GET", "history.csv"):
+                project_id = query.get("project_id", "")
                 with app.conn() as conn:
-                    body = csvio.export_history(db.get_history(conn))
+                    rows = db.get_project_history(conn, project_id) if project_id else db.get_history(conn)
+                    body = csvio.export_history(rows)
+                suffix = f"-{project_id}" if project_id else "-all"
                 return self._send(200, body, "text/csv; charset=utf-8", {
-                    "Content-Disposition": f"attachment; filename=\"history-{today}.csv\""})
+                    "Content-Disposition": f"attachment; filename=\"history-{today}{suffix}.csv\""})
             if route == ("POST", "import"):
                 data = self._body()
                 with app.lock:
@@ -332,11 +350,17 @@ def make_handler(app):
                     item = transcripts.get_transcript(conn, parts[1])
                     item.pop("raw_text", None)
                     return self._json(200, item)
-            if route == ("GET", "drafts") and len(parts) == 1:
+            if route == ("GET", "drafts") and parts[1:] == ["count"]:
                 with app.conn() as conn:
-                    return self._json(200, {"items": transcripts.list_drafts(
-                        conn, project_id=query.get("project_id", ""), status=query.get("status", ""),
-                        transcript_id=query.get("transcript_id", ""))})
+                    return self._json(200, transcripts.draft_counts(conn, status=query.get("status", "草稿")))
+            if route == ("GET", "drafts") and len(parts) == 1:
+                limit, offset = _page_args(query)
+                scope = {"project_id": query.get("project_id", ""), "status": query.get("status", ""),
+                         "transcript_id": query.get("transcript_id", "")}
+                with app.conn() as conn:
+                    items = transcripts.list_drafts(conn, **scope, limit=limit, offset=offset)
+                    total = transcripts.count_drafts(conn, **scope)
+                return self._json(200, {"items": items, "total": total, "limit": limit, "offset": offset})
             if route == ("GET", "drafts") and len(parts) == 2:
                 with app.conn() as conn:
                     return self._json(200, transcripts.get_draft(conn, parts[1]))

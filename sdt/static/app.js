@@ -26,7 +26,7 @@ let transcriptListVersion = 0;
 /** @type {{transcript_id: string, preview_token: string, linked: boolean} | null} */
 let transcriptDeletion = null;
 let state = {
-  view: "all", editing: null, editingIssue: null, projects: [], importFile: null, sourceTranscript: null,
+  view: "all", editing: null, editingIssue: null, projects: [], importFile: null, sourceTranscript: null, draftOffset: 0,
   layout: "board", expanded: null, selected: null, items: [], facetItems: [], counts: {}, total: 0,
   history: [], historyFor: null, sections: null, sidebarIcons: false,
 };
@@ -97,6 +97,9 @@ function paintExportScope() {
   link.href = "/api/export.csv" + (id ? "?" + new URLSearchParams({ project_id: id }) : "");
   link.textContent = `匯出 CSV（${scope}）`;
   $("#btn-agenda").textContent = `議程草稿（${scope}）`;
+  const history = $("#btn-history");
+  history.href = "/api/history.csv" + (id ? "?" + new URLSearchParams({ project_id: id }) : "");
+  history.textContent = `匯出變更紀錄（${scope}）`;
 }
 
 function fillProjectSelect(sel, { includeNew = false, selected = "" } = {}) {
@@ -180,13 +183,13 @@ function applyStoredLayout() {
   }
 }
 
-async function pendingDraftCount(projects) {
-  if (!projects.length) return 0;
-  const counts = await Promise.all(projects.map((p) =>
-    api("/api/drafts?" + new URLSearchParams({ project_id: p.project_id, status: "草稿" }))
-      .then((data) => data.items.length)
-      .catch(() => 0)));
-  return counts.reduce((sum, n) => sum + n, 0);
+// 只取 SQL 計數，不下載草稿內容。取不到時回傳 null，畫面顯示「?」而不是 0。
+async function pendingDraftCount() {
+  try {
+    return (await api("/api/drafts/count?" + new URLSearchParams({ status: "草稿" }))).total;
+  } catch (e) {
+    return null;
+  }
 }
 
 async function refresh() {
@@ -215,10 +218,11 @@ async function refresh() {
   paint();
   $("#btn-sample-clear").hidden = !data.has_sample;
   $("#btn-sample-load").hidden = data.has_sample;
-  const pending = await pendingDraftCount(state.projects);
+  const pending = await pendingDraftCount();
   if (version !== refreshVersion) return;
   const badge = $("#draft-count");
-  badge.textContent = String(pending);
+  badge.textContent = pending === null ? "?" : String(pending);
+  badge.title = pending === null ? "無法取得待審草稿數量" : "";
   if (state.layout === "split" && state.selected && state.historyFor !== state.selected) {
     loadSplitHistory(state.selected).catch((e) => showMsg(e.message, "error"));
   }
@@ -1441,46 +1445,61 @@ async function openDrafts() {
   state.projects = (await api("/api/projects")).items;
   fillProjectSelect($("#draft-project"), { selected: $("#f-project").value });
   $("#dlg-drafts").showModal();
-  await reloadDrafts();
+  await reloadDrafts({ resetPage: true });
 }
 
-async function reloadDrafts() {
+const DRAFT_PAGE_SIZE = 50;
+
+async function reloadDrafts({ resetPage = false } = {}) {
   const box = $("#draft-list");
+  const pager = $("#draft-pager");
   box.replaceChildren();
+  pager.replaceChildren();
+  if (resetPage) state.draftOffset = 0;
   const projectId = $("#draft-project").value;
   if (!projectId) {
     box.append(el("p", "請先建立專案。", "hint"));
     return;
   }
-  const params = new URLSearchParams({ project_id: projectId });
+  const params = new URLSearchParams({ project_id: projectId, limit: String(DRAFT_PAGE_SIZE) });
   if ($("#draft-status").value) params.set("status", $("#draft-status").value);
-  const data = await api("/api/drafts?" + params.toString());
+  params.set("offset", String(state.draftOffset));
+  let data = await api("/api/drafts?" + params.toString());
+  // 入帳、捨棄或刪除後這一頁可能變空：退回最後一頁
+  if (!data.items.length && data.total && state.draftOffset) {
+    state.draftOffset = Math.floor((data.total - 1) / DRAFT_PAGE_SIZE) * DRAFT_PAGE_SIZE;
+    params.set("offset", String(state.draftOffset));
+    data = await api("/api/drafts?" + params.toString());
+  }
   if (!data.items.length) {
     box.append(el("p", "沒有草稿。", "hint"));
     return;
   }
   for (const draft of data.items) box.append(renderDraft(draft));
+  const first = data.offset + 1;
+  const last = data.offset + data.items.length;
+  const prev = el("button", "上一頁");
+  prev.type = "button";
+  prev.disabled = data.offset === 0;
+  prev.addEventListener("click", () => {
+    state.draftOffset = Math.max(0, data.offset - DRAFT_PAGE_SIZE);
+    reloadDrafts().catch((e) => showMsg(e.message, "error"));
+  });
+  const next = el("button", "下一頁");
+  next.type = "button";
+  next.disabled = last >= data.total;
+  next.addEventListener("click", () => {
+    state.draftOffset = data.offset + DRAFT_PAGE_SIZE;
+    reloadDrafts().catch((e) => showMsg(e.message, "error"));
+  });
+  pager.append(prev, el("span", `第 ${first}–${last} 筆，共 ${data.total} 筆`, "hint"), next);
 }
 
 function renderDraft(draft) {
   const card = el("article", "", "card");
   card.append(el("h3", `${draft.draft_id}\uff5c${draft.kind}\uff5c${draft.review_status}`));
-  card.append(el("p", draft.location_label, "hint"));
-  card.append(el("p", `時間：${draft.timestamp_label}`, "hint"));
-  card.append(el("p", `抽取 ${draft.extraction_method || "—"}　句子位置 ${draft.sentence_index || "（舊資料未記錄）"}`, "hint"));
-  if (draft.rule_id || draft.reason) {
-    card.append(el("p", `規則 ${draft.rule_id || "—"}：${draft.reason || ""}`, "hint"));
-  }
-  if (draft.cue || draft.confidence) {
-    card.append(el("p", `對上的說法：${draft.cue || "—"}　信心：${draft.confidence || "—"}`, "hint"));
-  }
-  if (draft.review_gaps) card.append(el("p", `需人工核對：${draft.review_gaps}`, "hint"));
-  const refs = Array.isArray(draft.context_refs) ? draft.context_refs : [];
-  for (const ref of refs) {
-    const id = ref.segment_id || ref.source_segment_id || "";
-    card.append(el("p", `上下文段落 ${id}　${ref.timestamp_label || ""}（沒有併進原始引用）`, "hint"));
-    card.append(el("pre", ref.text || "", "quote"));
-  }
+  card.append(el("p", `${draft.location_label}　時間：${draft.timestamp_label}`, "hint"));
+  card.append(draftDetails(draft));
   card.append(el("p", `負責人：${draft.owner || "（空）"}（${draft.owner_origin}）　期限：${draft.due_date || "（空）"}（${draft.due_origin}）`, "hint"));
   card.append(el("p", "原始引用（不會被摘要修改覆寫）"));
   card.append(el("pre", draft.source_quote, "quote"));
@@ -1510,7 +1529,6 @@ function renderDraft(draft) {
   card.append(el("p", "\u7d50\u8ad6\u985e\u578b", "hint"), kind);
   card.append(el("p", "\u5f85\u8fa6\u52d5\u4f5c\u8207\u4ea4\u4ed8\u6210\u679c", "hint"), action, deliverable);
   card.append(el("p", "\u8ca0\u8cac\u4eba\u8207\u671f\u9650\u53ea\u6709\u539f\u6587\u660e\u78ba\u63d0\u4f9b\u6642\u624d\u586b\u3002", "hint"), owner, due);
-  card.append(el("p", draft.limitation, "hint"));
   const actions = el("div", "", "row-actions");
   if (draft.review_status === "\u8349\u7a3f") {
     const save = el("button", "\u5132\u5b58\u4fee\u8a02");
@@ -1538,9 +1556,39 @@ function renderDraft(draft) {
   return card;
 }
 
+// 規則、理由、核對缺漏、上下文與能力限制收在可展開區塊，第一次展開時才產生內容。
+function draftDetails(draft) {
+  const details = document.createElement("details");
+  details.className = "draft-details";
+  const method = draft.extraction_method === "manual" ? "人工" : (draft.extraction_method || "—");
+  const refs = Array.isArray(draft.context_refs) ? draft.context_refs : [];
+  const bits = [`抽取 ${method}`, draft.rule_id ? `規則 ${draft.rule_id}` : "", draft.confidence ? `信心 ${draft.confidence}` : "",
+    refs.length ? `上下文 ${refs.length} 段` : ""].filter(Boolean);
+  details.append(el("summary", `規則與核對細節（${bits.join("　")}）`));
+  details.addEventListener("toggle", () => {
+    if (!details.open || details.dataset.filled) return;
+    details.dataset.filled = "1";
+    details.append(el("p", `抽取 ${method}　句子位置 ${draft.sentence_index || "（舊資料未記錄）"}`, "hint"));
+    if (draft.rule_id || draft.reason) {
+      details.append(el("p", `規則 ${draft.rule_id || "—"}：${draft.reason || ""}`, "hint"));
+    }
+    if (draft.cue || draft.confidence) {
+      details.append(el("p", `對上的說法：${draft.cue || "—"}　信心：${draft.confidence || "—"}`, "hint"));
+    }
+    if (draft.review_gaps) details.append(el("p", `需人工核對：${draft.review_gaps}`, "hint"));
+    for (const ref of refs) {
+      const id = ref.segment_id || ref.source_segment_id || "";
+      details.append(el("p", `上下文段落 ${id}　${ref.timestamp_label || ""}（沒有併進原始引用）`, "hint"));
+      details.append(el("pre", ref.text || "", "quote"));
+    }
+    details.append(el("p", draft.limitation, "hint"));
+  });
+  return details;
+}
+
 async function saveDraft(id, summary, owner, due, kind, action, deliverable) {
   await api("/api/drafts/" + encodeURIComponent(id), { method: "PUT", json: { summary, owner, due_date: due, kind, action, deliverable } });
-  showMsg(`${id} ?????????????`);
+  showMsg(`${id} 已儲存修改，尚未入帳。`);
   await reloadDrafts();
 }
 
@@ -1822,8 +1870,8 @@ async function init() {
   $("#btn-draft-close").addEventListener("click", () => $("#dlg-drafts").close());
   $("#btn-source-close").addEventListener("click", () => $("#dlg-source").close());
   $("#btn-draft-reload").addEventListener("click", () => reloadDrafts().catch((e) => showMsg(e.message, "error")));
-  $("#draft-project").addEventListener("change", () => reloadDrafts().catch((e) => showMsg(e.message, "error")));
-  $("#draft-status").addEventListener("change", () => reloadDrafts().catch((e) => showMsg(e.message, "error")));
+  $("#draft-project").addEventListener("change", () => reloadDrafts({ resetPage: true }).catch((e) => showMsg(e.message, "error")));
+  $("#draft-status").addEventListener("change", () => reloadDrafts({ resetPage: true }).catch((e) => showMsg(e.message, "error")));
   $("#btn-project").addEventListener("click", () => openRename().catch((e) => showMsg(e.message, "error")));
   $("#btn-rename-close").addEventListener("click", () => $("#dlg-project").close());
   $("#btn-rename-save").addEventListener("click", () => saveRename());

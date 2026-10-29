@@ -1208,21 +1208,47 @@ def get_segment(conn, transcript_id, segment_id):
     return _public_segment(row)
 
 
-def list_drafts(conn, *, project_id, status="", transcript_id=""):
+DRAFT_STATUSES = ("草稿", "已確認", "已捨棄")
+
+
+def _draft_filter(conn, project_id, status, transcript_id):
     db.get_project(conn, project_id)
     clauses = ["project_id=?"]
     params = [project_id]
     if status:
-        if status not in {"草稿", "已確認", "已捨棄"}:
+        if status not in DRAFT_STATUSES:
             raise db.ValidationError(["審核狀態必須是草稿、已確認或已捨棄"])
         clauses.append("review_status=?")
         params.append(status)
     if transcript_id:
         clauses.append("transcript_id=?")
         params.append(transcript_id)
+    return " AND ".join(clauses), params
+
+
+def list_drafts(conn, *, project_id, status="", transcript_id="", limit=None, offset=0):
+    """依草稿編號排序。limit 為 None 時回傳全部；否則只回傳 offset 起的 limit 筆。"""
+    where, params = _draft_filter(conn, project_id, status, transcript_id)
+    sql = f"SELECT * FROM drafts WHERE {where} ORDER BY draft_id"
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params = [*params, limit, offset]
+    return [_public_draft(r) for r in conn.execute(sql, params)]
+
+
+def count_drafts(conn, *, project_id, status="", transcript_id=""):
+    where, params = _draft_filter(conn, project_id, status, transcript_id)
+    return conn.execute(f"SELECT COUNT(*) FROM drafts WHERE {where}", params).fetchone()[0]
+
+
+def draft_counts(conn, *, status="草稿"):
+    """各專案的草稿筆數，用 SQL 計數，不載入草稿內容。"""
+    if status not in DRAFT_STATUSES:
+        raise db.ValidationError(["審核狀態必須是草稿、已確認或已捨棄"])
     rows = conn.execute(
-        f"SELECT * FROM drafts WHERE {' AND '.join(clauses)} ORDER BY draft_id", params)
-    return [_public_draft(r) for r in rows]
+        "SELECT project_id, COUNT(*) FROM drafts WHERE review_status=? GROUP BY project_id", (status,))
+    by_project = {r[0]: r[1] for r in rows}
+    return {"status": status, "total": sum(by_project.values()), "by_project": by_project}
 
 
 def get_draft(conn, draft_id):
