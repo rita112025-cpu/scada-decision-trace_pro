@@ -13,3 +13,5 @@ sdt-verify/
 verify-reports/
 # 本機口語說法清單可能含真實講法，不進版控
 cues.json
+# local-only files (backup cleanup 2026-11-05)
+*.zip
